@@ -1,41 +1,51 @@
-"""Single-file HTML dashboard for the research digest sentiment scoring.
+"""Single-file HTML dashboard for the research digest sentiment scoring (v2 schema).
 
-Reads digest.db (see collect.py) and writes one self-contained HTML report:
-daily sentiment trend, per-item scores/summaries, and an explanation of how
-scores are produced. Charts and the Plotly.js library are embedded, so the
-file opens directly in a browser with no server needed.
+Reads scores/items/extract_status from digest.db and, if a companion KRX
+price database is reachable, validates the index against realized returns
+(see market.py / validate.py). Self-contained: one HTML file, CSS design
+tokens for light/dark, charts embedded via Plotly.
 
 Usage
 -----
-    python dashboard.py                    # writes output/dashboard.html
+    python dashboard.py                              # writes output/dashboard.html + docs/index.html
+    python dashboard.py --prices-db ../pairs-trading-krx/prices.db
+    python dashboard.py --embed-plotly               # inline plotly.js instead of CDN (offline use)
+    python dashboard.py --ewma-span 14
 """
 
 from __future__ import annotations
 
 import argparse
+import json
+import sqlite3
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.io as pio
-from plotly.offline import get_plotlyjs
 from plotly.subplots import make_subplots
 
-from store import get_connection
+import market
+from index import daily_index
+from store import get_connection, latest_scores
 
 OUT = Path(__file__).parent / "output"
+DOCS_DIR = Path(__file__).parent / "docs"
 
-CHART_PAPER = "#FAF9F4"
-CHART_INK = "#211D14"
-COLORWAY = ["#9C6B2E", "#3F7A5E", "#B3432B", "#4A5A6B", "#7A5C3E"]
+PLOTLY_VERSION = "6.9.0"
+PLOTLY_CDN = f"https://cdn.plot.ly/plotly-{PLOTLY_VERSION}.min.js"
 
-SCOPE_LABELS = {"macro": "매크로", "market": "시장 전반", "sector": "섹터", "stock": "개별종목"}
-SCOPE_COLORS = {"macro": "#4A5A6B", "market": "#9C6B2E", "sector": "#7A5C3E", "stock": "#3F7A5E"}
+LEVELS = ("macro", "market", "sector", "stock")
+LEVEL_LABELS = {"macro": "매크로", "market": "시장 전반", "sector": "섹터", "stock": "개별종목"}
+LEVEL_COLORS = {"macro": "#4A5A6B", "market": "#9C6B2E", "sector": "#7A5C3E", "stock": "#3F7A5E"}
+NEGATIVE = "#B3432B"
+POSITIVE = "#3F7A5E"
+INK_FALLBACK = "#211D14"  # only used before the theme-sync JS runs
 
-
-def _rgba(hex_color: str, alpha: float) -> str:
-    r, g, b = int(hex_color[1:3], 16), int(hex_color[3:5], 16), int(hex_color[5:7], 16)
-    return f"rgba({r},{g},{b},{alpha})"
+MIN_GROUP_N = 30
+LEADLAG_RANGE = range(-5, 6)
+EVENT_WINDOW = range(-5, 11)
 
 STYLE = """
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
@@ -58,290 +68,571 @@ STYLE = """
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --ink: #EDE9DF;
-    --ink-soft: #B3AB99;
-    --paper: #15130D;
-    --surface: #1E1B13;
-    --border: #332E20;
-    --accent: #D2A25C;
-    --accent-soft: #362B18;
-    --negative: #E08066;
-    --negative-soft: #3A241F;
-    --positive: #7FBBA0;
-    --positive-soft: #1F3229;
+    --ink: #EDE9DF; --ink-soft: #B3AB99; --paper: #15130D; --surface: #1E1B13;
+    --border: #332E20; --accent: #D2A25C; --accent-soft: #362B18;
+    --negative: #E08066; --negative-soft: #3A241F; --positive: #7FBBA0; --positive-soft: #1F3229;
   }
 }
 :root[data-theme="dark"] {
-  --ink: #EDE9DF;
-  --ink-soft: #B3AB99;
-  --paper: #15130D;
-  --surface: #1E1B13;
-  --border: #332E20;
-  --accent: #D2A25C;
-  --accent-soft: #362B18;
-  --negative: #E08066;
-  --negative-soft: #3A241F;
-  --positive: #7FBBA0;
-  --positive-soft: #1F3229;
+  --ink: #EDE9DF; --ink-soft: #B3AB99; --paper: #15130D; --surface: #1E1B13;
+  --border: #332E20; --accent: #D2A25C; --accent-soft: #362B18;
+  --negative: #E08066; --negative-soft: #3A241F; --positive: #7FBBA0; --positive-soft: #1F3229;
 }
 * { box-sizing: border-box; }
 body { font-family: var(--font-body); background: var(--paper); color: var(--ink); margin: 0; padding: 2.5rem 1.5rem 4rem; }
-.page { max-width: 1080px; margin: 0 auto; display: flex; flex-direction: column; gap: 2.25rem; }
+.page { max-width: 1120px; margin: 0 auto; display: flex; flex-direction: column; gap: 2.25rem; }
 h1 { font-family: var(--font-display); font-weight: 700; font-size: 2rem; margin: 0 0 0.3rem; text-wrap: balance; }
 h2 { font-family: var(--font-display); font-weight: 600; font-size: 1.3rem; margin: 0 0 1rem; }
 .eyebrow { font-family: var(--font-mono); font-size: 0.75rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent); margin: 0 0 0.5rem; }
 .meta { color: var(--ink-soft); font-size: 0.95rem; margin: 0; }
-.stat-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 1px; background: var(--border); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+.stat-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 1px; background: var(--border); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
 .stat { background: var(--surface); padding: 1rem 1.2rem; display: flex; flex-direction: column; gap: 0.3rem; }
-.stat .label { font-size: 0.78rem; color: var(--ink-soft); }
-.stat .value { font-family: var(--font-mono); font-size: 1.4rem; font-variant-numeric: tabular-nums; }
+.stat .label { font-size: 0.76rem; color: var(--ink-soft); }
+.stat .value { font-family: var(--font-mono); font-size: 1.3rem; font-variant-numeric: tabular-nums; }
 .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 1.5rem; }
 .chart-card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 1.5rem; }
-.chart-card .plot-wrap { background: %(paper)s; border-radius: 8px; padding: 0.5rem; overflow-x: auto; }
-table { border-collapse: collapse; width: 100%%; font-variant-numeric: tabular-nums; }
-th, td { padding: 0.55rem 0.8rem; border-bottom: 1px solid var(--border); text-align: right; font-size: 0.88rem; vertical-align: top; }
-th:nth-child(1), td:nth-child(1), th:nth-child(2), td:nth-child(2), th:nth-child(4), td:nth-child(4), th:nth-child(6), td:nth-child(6) { text-align: left; }
-th { font-family: var(--font-mono); font-weight: 500; font-size: 0.72rem; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ink-soft); }
+.chart-card .plot-wrap { overflow-x: auto; }
+.chart-card .note { color: var(--ink-soft); font-size: 0.85rem; margin: 0.5rem 0 0; }
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+th, td { padding: 0.5rem 0.7rem; border-bottom: 1px solid var(--border); text-align: right; font-size: 0.86rem; vertical-align: top; }
+th.left, td.left { text-align: left; }
+th { font-family: var(--font-mono); font-weight: 500; font-size: 0.7rem; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ink-soft); }
 td { font-family: var(--font-body); }
 td.mono { font-family: var(--font-mono); }
 tr:last-child td { border-bottom: none; }
-.chip { display: inline-flex; align-items: center; padding: 0.15rem 0.55rem; border-radius: 999px; font-family: var(--font-mono); font-size: 0.82rem; font-weight: 500; white-space: nowrap; }
+.chip { display: inline-flex; align-items: center; padding: 0.15rem 0.55rem; border-radius: 999px; font-family: var(--font-mono); font-size: 0.8rem; font-weight: 500; white-space: nowrap; }
 .chip.neg { background: var(--negative-soft); color: var(--negative); }
 .chip.pos { background: var(--positive-soft); color: var(--positive); }
 .chip.neu { background: var(--accent-soft); color: var(--accent); }
 .scale { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.75rem; }
-.scale .band { font-family: var(--font-mono); font-size: 0.8rem; padding: 0.3rem 0.6rem; border-radius: 8px; border: 1px solid var(--border); }
+.scale .band { font-family: var(--font-mono); font-size: 0.78rem; padding: 0.3rem 0.6rem; border-radius: 8px; border: 1px solid var(--border); }
+.limits { margin: 0; padding-left: 1.2rem; color: var(--ink-soft); font-size: 0.92rem; line-height: 1.6; }
+.filters { display: flex; gap: 0.75rem; flex-wrap: wrap; margin-bottom: 1rem; }
+.filters select, .filters input { font-family: var(--font-body); font-size: 0.85rem; padding: 0.4rem 0.6rem; border-radius: 6px; border: 1px solid var(--border); background: var(--surface); color: var(--ink); }
 footer { color: var(--ink-soft); font-size: 0.85rem; border-top: 1px solid var(--border); padding-top: 1.25rem; }
 a { color: var(--accent); }
 @media (max-width: 640px) { body { padding: 1.5rem 1rem 3rem; } }
 </style>
-""" % {"paper": CHART_PAPER}
+"""
+
+THEME_SCRIPT = """
+<script>
+function applyChartTheme() {
+  var style = getComputedStyle(document.documentElement);
+  var ink = style.getPropertyValue('--ink').trim();
+  var grid = style.getPropertyValue('--border').trim();
+  document.querySelectorAll('.js-plotly-plot').forEach(function (div) {
+    var layout = div.layout || {};
+    var update = { paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)', 'font.color': ink, 'legend.font.color': ink };
+    Object.keys(layout).forEach(function (key) {
+      if (/^(xaxis|yaxis)\\d*$/.test(key)) {
+        update[key + '.gridcolor'] = grid;
+        update[key + '.zerolinecolor'] = grid;
+        update[key + '.tickfont.color'] = ink;
+        update[key + '.linecolor'] = grid;
+      }
+    });
+    try { Plotly.relayout(div, update); } catch (e) {}
+  });
+}
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyChartTheme);
+window.addEventListener('load', applyChartTheme);
+applyChartTheme();
+</script>
+"""
 
 
-def build_sentiment_fig(daily: pd.DataFrame) -> go.Figure:
-    """One clean line: 리서치 자료들이 그날 시장을 어떻게 봤는지, 하루 단위 평균 톤."""
-    fig = go.Figure()
-    fig.add_hline(y=0, line_color="#B8B2A0", line_width=1)
-    fig.add_scatter(
-        x=daily["date"], y=daily["avg_score"], mode="lines+markers",
-        line=dict(color=CHART_INK, width=2),
-        marker=dict(size=7, color=["#B3432B" if v < 0 else "#3F7A5E" for v in daily["avg_score"]]),
-        fill="tozeroy", fillcolor=_rgba(CHART_INK, 0.06),
-        hovertemplate="%{x|%Y-%m-%d}<br>평균 %{y:+.2f}<extra></extra>",
-        showlegend=False,
+def _fig_layout_base() -> dict:
+    """Transparent background so the chart sits on the card's own surface in
+    either theme; font/gridline colors are corrected at runtime by
+    THEME_SCRIPT (Plotly renders to a static canvas, so it can't read CSS
+    variables itself at draw time)."""
+    return dict(
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="IBM Plex Sans, sans-serif", color=INK_FALLBACK, size=12),
+        margin=dict(l=10, r=10, t=40, b=10),
     )
-    fig.update_layout(
-        title="리서치 자료의 일별 시장 심리 — 위(초록)는 우호적, 아래(빨강)는 비우호적 논조 우세",
-        paper_bgcolor=CHART_PAPER, plot_bgcolor=CHART_PAPER,
-        font=dict(family="IBM Plex Sans, sans-serif", color=CHART_INK, size=13),
-        margin=dict(l=10, r=10, t=50, b=10),
-        height=340,
-        yaxis=dict(title="-5 매우부정 · 0 중립 · +5 매우긍정", range=[-5.2, 5.2], gridcolor="#E3E0D8", zerolinecolor="#B8B2A0"),
-        xaxis=dict(gridcolor="#E3E0D8"),
-    )
-    return fig
 
 
-def build_scope_fig(scope_daily: pd.DataFrame) -> go.Figure:
-    """Small multiples (one row per scope) sharing a real date axis, so the same
-    calendar day always lines up vertically across rows even when a scope has no
-    items on some days (grouped bars on a mismatched category axis were misleading)."""
-    scopes = [s for s in ("macro", "market", "sector", "stock") if not scope_daily[scope_daily["scope"] == s].empty]
+def _to_html(fig: go.Figure) -> str:
+    return pio.to_html(fig, include_plotlyjs=False, full_html=False)
+
+
+# ---------------------------------------------------------------------------
+# Chart 1: sentiment index (EWMA) vs market proxy, with a sample-size subplot
+# ---------------------------------------------------------------------------
+def build_index_vs_market_fig(idx: pd.DataFrame, market_df: pd.DataFrame | None, ewma_span: int) -> go.Figure:
     fig = make_subplots(
-        rows=len(scopes), cols=1, shared_xaxes=True,
-        subplot_titles=[f"{SCOPE_LABELS[s]} ({scope_daily[scope_daily['scope'] == s]['n'].sum():.0f}건)" for s in scopes],
-        vertical_spacing=0.08,
+        rows=2, cols=1, shared_xaxes=True, row_heights=[0.72, 0.28], vertical_spacing=0.05,
+        specs=[[{"secondary_y": True}], [{"secondary_y": False}]],
     )
-    for i, scope in enumerate(scopes, start=1):
-        sub = scope_daily[scope_daily["scope"] == scope]
-        fig.add_scatter(
-            x=sub["date"], y=sub["avg_score"], mode="lines+markers", name=SCOPE_LABELS[scope],
-            line=dict(color=SCOPE_COLORS[scope], width=2), marker=dict(size=5),
-            fill="tozeroy", fillcolor=_rgba(SCOPE_COLORS[scope], 0.13),
-            hovertemplate="%{x|%Y-%m-%d}<br>평균 %{y:+.2f}<extra></extra>",
-            showlegend=False, row=i, col=1,
-        )
-        fig.add_hline(y=0, line_color="#B8B2A0", line_width=1, row=i, col=1)
-        fig.update_yaxes(range=[-5.2, 5.2], gridcolor="#E3E0D8", row=i, col=1)
-        fig.update_xaxes(gridcolor="#E3E0D8", row=i, col=1)
+
+    dates = pd.to_datetime(idx["date"])
+    ewma = idx["index_value"].ewm(span=ewma_span, min_periods=1).mean()
+    fig.add_scatter(x=dates, y=ewma, name=f"감성지수 (EWMA{ewma_span})", mode="lines",
+                     line=dict(color="#9C6B2E", width=2.4), row=1, col=1, secondary_y=False)
+
+    if market_df is not None and not market_df.empty:
+        m = market_df.copy()
+        m["date"] = pd.to_datetime(m["date"])
+        m = m[(m["date"] >= dates.min()) & (m["date"] <= dates.max())]
+        level = (1 + m["market_return"]).cumprod()
+        fig.add_scatter(x=m["date"], y=level, name="시장 대용치 (누적, 시작=1)", mode="lines",
+                         line=dict(color="#4A5A6B", width=1.6, dash="dot"), row=1, col=1, secondary_y=True)
+
+    fig.add_bar(x=dates, y=idx["n_items"], name="일별 표본수", marker_color="#DDDACC", row=2, col=1)
 
     fig.update_layout(
-        title="범위별 일별 심리 점수 — 매크로/시장/섹터/종목이 같은 날 서로 다르게 움직였는지 비교",
-        paper_bgcolor=CHART_PAPER, plot_bgcolor=CHART_PAPER,
-        font=dict(family="IBM Plex Sans, sans-serif", color=CHART_INK, size=13),
-        margin=dict(l=10, r=10, t=50, b=10),
-        height=190 * len(scopes) + 60,
-        showlegend=False,
+        **_fig_layout_base(),
+        title="감성지수(EWMA) vs 시장 대용치 — 위 라인이 시장보다 먼저 움직이는지 3초 안에 비교",
+        height=460, bargap=0.2,
+        legend=dict(orientation="h", y=1.12),
+    )
+    fig.update_yaxes(title_text="감성지수", row=1, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="시장 누적수익", row=1, col=1, secondary_y=True, showgrid=False)
+    fig.update_yaxes(title_text="표본수", row=2, col=1)
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Chart 2: lead-lag correlation with 95% CI (Fisher z)
+# ---------------------------------------------------------------------------
+def _fisher_ci(r: float, n: int) -> tuple[float, float]:
+    if n < 4 or pd.isna(r) or abs(r) >= 1:
+        return (float("nan"), float("nan"))
+    z = np.arctanh(r)
+    se = 1 / np.sqrt(n - 3)
+    return (np.tanh(z - 1.96 * se), np.tanh(z + 1.96 * se))
+
+
+def build_leadlag_fig(idx_series: pd.Series, market_series: pd.Series) -> tuple[go.Figure, pd.DataFrame]:
+    rows = []
+    for k in LEADLAG_RANGE:
+        shifted = market_series.shift(-k)
+        merged = pd.DataFrame({"index": idx_series, "market": shifted}).dropna()
+        n = len(merged)
+        r = merged["index"].corr(merged["market"]) if n >= 3 else float("nan")
+        lo, hi = _fisher_ci(r, n)
+        rows.append({"k": k, "corr": r, "n": n, "ci_lo": lo, "ci_hi": hi})
+    df = pd.DataFrame(rows)
+
+    fig = go.Figure()
+    colors = [POSITIVE if v >= 0 else NEGATIVE for v in df["corr"].fillna(0)]
+    err_plus = (df["ci_hi"] - df["corr"]).clip(lower=0)
+    err_minus = (df["corr"] - df["ci_lo"]).clip(lower=0)
+    fig.add_bar(
+        x=df["k"], y=df["corr"], marker_color=colors,
+        error_y=dict(type="data", array=err_plus, arrayminus=err_minus, visible=True, color="#8A8272"),
+        hovertemplate="k=%{x}<br>corr=%{y:+.3f}<extra></extra>",
+    )
+    fig.add_hline(y=0, line_color="#8A8272", line_width=1)
+    fig.add_vline(x=0, line_color="#8A8272", line_width=1, line_dash="dot")
+    fig.update_layout(
+        **_fig_layout_base(),
+        title="Lead-lag 상관: corr(감성지수_t, 시장수익률_t+k) — k&lt;0은 지수가 뒤따라감, k&gt;0은 지수가 앞섬 (95% CI)",
+        height=340, xaxis_title="k (거래일)", yaxis_title="상관계수",
+    )
+    return fig, df
+
+
+# ---------------------------------------------------------------------------
+# Chart 3: score distribution histogram, split by level
+# ---------------------------------------------------------------------------
+def build_score_hist_fig(scores: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    for level in LEVELS:
+        vals = scores.loc[scores["level"] == level, "score"].dropna()
+        if vals.empty:
+            continue
+        fig.add_histogram(
+            x=vals, name=LEVEL_LABELS[level], marker_color=LEVEL_COLORS[level],
+            opacity=0.65, xbins=dict(start=-3.5, end=3.5, size=1),
+        )
+    fig.update_layout(
+        **_fig_layout_base(),
+        title="점수 분포 (direction × magnitude, -3..+3) — level별 색 분리",
+        barmode="overlay", height=340, xaxis_title="score", yaxis_title="건수",
+        legend=dict(orientation="h", y=1.12),
     )
     return fig
 
 
-def build_content(conn) -> str:
-    total = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
-    scored = conn.execute("SELECT COUNT(*) FROM items WHERE sentiment_score IS NOT NULL").fetchone()[0]
+# ---------------------------------------------------------------------------
+# Chart 4: level x week heatmap
+# ---------------------------------------------------------------------------
+def build_heatmap_fig(scores_with_date: pd.DataFrame) -> go.Figure:
+    df = scores_with_date.dropna(subset=["score"]).copy()
+    df["date"] = pd.to_datetime(df["date"])
+    df["week"] = df["date"].dt.to_period("W").apply(lambda p: p.start_time)
 
-    daily = pd.read_sql_query(
+    pivot = df.pivot_table(index="level", columns="week", values="score", aggfunc="mean")
+    pivot = pivot.reindex(LEVELS)
+    week_labels = [d.strftime("%m/%d") for d in pivot.columns]
+
+    fig = go.Figure(go.Heatmap(
+        z=pivot.values, x=week_labels, y=[LEVEL_LABELS[l] for l in pivot.index],
+        colorscale=[[0, NEGATIVE], [0.5, "#EEEEE7"], [1, POSITIVE]], zmid=0,
+        colorbar=dict(title="평균 점수"),
+        hovertemplate="주: %{x}<br>%{y}: %{z:+.2f}<extra></extra>",
+    ))
+    fig.update_layout(
+        **_fig_layout_base(),
+        title="level × 주(week) 평균 점수 히트맵",
+        height=280,
+    )
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Chart 5: per-channel calibration
+# ---------------------------------------------------------------------------
+def build_channel_fig(channel_stats: pd.DataFrame) -> go.Figure:
+    df = channel_stats.sort_values("avg_score")
+    colors = [POSITIVE if v >= 0 else NEGATIVE for v in df["avg_score"]]
+    fig = go.Figure()
+    fig.add_bar(
+        x=df["avg_score"], y=df["channel"], orientation="h", marker_color=colors,
+        customdata=np.stack([df["n_scored"], df["coverage_pct"]], axis=-1),
+        hovertemplate="%{y}<br>평균 %{x:+.2f} · 채점 %{customdata[0]}건 · 커버리지 %{customdata[1]:.0f}%<extra></extra>",
+    )
+    fig.add_vline(x=0, line_color="#8A8272", line_width=1)
+    fig.update_layout(
+        **_fig_layout_base(),
+        title="채널별 논조 캘리브레이션 (평균 점수) — 채널 편향은 숨기지 않고 그대로 표시",
+        height=120 + 32 * len(df), xaxis_title="평균 점수",
+    )
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Chart 7: event study CAR (only when prices.db is reachable)
+# ---------------------------------------------------------------------------
+def build_event_study_fig(conn, prices_db: str) -> tuple[go.Figure | None, str | None]:
+    try:
+        prices = market.load_prices(prices_db)
+        if prices.empty:
+            return None, f"{prices_db}에 데이터가 없습니다."
+    except Exception as e:
+        return None, f"{prices_db}를 읽을 수 없습니다 ({e}). --prices-db로 경로를 지정하세요."
+
+    mkt = market.market_proxy(prices).set_index("date")["market_return"]
+    cal = market.trading_calendar(prices)
+    wide = prices.pivot(index="date", columns="ticker", values="close").sort_index()
+    returns = wide.pct_change(fill_method=None)
+
+    scored = pd.read_sql_query(
         """
-        SELECT substr(date,1,10) AS date, AVG(sentiment_score) AS avg_score, COUNT(*) AS n
-        FROM items WHERE sentiment_score IS NOT NULL
-        GROUP BY date ORDER BY date
+        SELECT s.ticker, s.direction, i.date AS event_date
+        FROM scores s
+        JOIN items i ON i.chat_id = s.chat_id AND i.message_id = s.message_id
+        WHERE s.ticker IS NOT NULL AND s.direction IS NOT NULL AND s.direction != 0
         """,
         conn,
     )
-    daily["date"] = pd.to_datetime(daily["date"])
+    if scored.empty:
+        return None, "ticker가 태깅된 채점 항목이 없습니다."
+    scored["event_date"] = pd.to_datetime(scored["event_date"].str.slice(0, 10))
 
-    scope_daily = pd.read_sql_query(
-        """
-        SELECT substr(date,1,10) AS date, scope, AVG(sentiment_score) AS avg_score, COUNT(*) AS n
-        FROM items WHERE sentiment_score IS NOT NULL AND scope IS NOT NULL
-        GROUP BY date, scope ORDER BY date
-        """,
-        conn,
+    records = []
+    for _, row in scored.iterrows():
+        ticker = row["ticker"]
+        if ticker not in returns.columns:
+            continue
+        t0 = market.next_trading_day(cal, row["event_date"])
+        if t0 is None:
+            continue
+        t0_pos = cal.get_indexer([t0])[0]
+        car = 0.0
+        car_by_k = {}
+        for k in EVENT_WINDOW:
+            pos = t0_pos + k
+            if 0 <= pos < len(cal):
+                d = cal[pos]
+                r = returns.loc[d, ticker] if d in returns.index else np.nan
+                m = mkt.loc[d] if d in mkt.index else np.nan
+                if pd.notna(r) and pd.notna(m):
+                    car += (r - m)
+            car_by_k[k] = car
+        records.append({"direction": row["direction"], **car_by_k})
+
+    ev = pd.DataFrame(records)
+    if ev.empty:
+        return None, "이벤트가 매칭되지 않았습니다 (prices.db에 없는 ticker이거나 거래일 매핑 실패)."
+
+    fig = go.Figure()
+    for direction, label, color in ((1, "direction=+1", POSITIVE), (-1, "direction=-1", NEGATIVE)):
+        group = ev[ev["direction"] == direction]
+        n = len(group)
+        if n == 0:
+            continue
+        means = [group[k].mean() for k in EVENT_WINDOW]
+        name = f"{label} (n={n}{'  ⚠n<30' if n < MIN_GROUP_N else ''})"
+        fig.add_scatter(x=list(EVENT_WINDOW), y=means, mode="lines+markers", name=name, line=dict(color=color, width=2))
+
+    fig.add_vline(x=0, line_color="#8A8272", line_width=1, line_dash="dot")
+    fig.add_hline(y=0, line_color="#8A8272", line_width=1)
+    fig.update_layout(
+        **_fig_layout_base(),
+        title="이벤트 스터디: 종목 태깅 항목의 CAR (t-5..t+10, direction별)",
+        height=340, xaxis_title="게시일 기준 거래일 (t=0)", yaxis_title="누적초과수익(CAR)",
+        legend=dict(orientation="h", y=1.15),
     )
-    scope_daily["date"] = pd.to_datetime(scope_daily["date"])
+    return fig, None
 
-    scope_summary_rows = "".join(
-        f"<tr><td>{SCOPE_LABELS.get(scope, scope)}</td><td class='mono'>{n}</td>"
-        f"<td><span class='chip {'pos' if avg > 0 else 'neg' if avg < 0 else 'neu'}'>{avg:+.2f}</span></td></tr>"
-        for scope, n, avg in conn.execute(
-            """
-            SELECT scope, COUNT(*), AVG(sentiment_score)
-            FROM items WHERE sentiment_score IS NOT NULL AND scope IS NOT NULL
-            GROUP BY scope ORDER BY 2 DESC
-            """
-        ).fetchall()
-    )
 
-    topic_rows = "".join(
-        f"<tr><td>{topic}</td><td>{SCOPE_LABELS.get(scope, scope)}</td><td class='mono'>{n}</td>"
-        f"<td><span class='chip {'pos' if avg > 0 else 'neg' if avg < 0 else 'neu'}'>{avg:+.2f}</span></td></tr>"
-        for topic, scope, n, avg in conn.execute(
-            """
-            SELECT topic, scope, COUNT(*) AS n, AVG(sentiment_score)
-            FROM items WHERE sentiment_score IS NOT NULL AND topic IS NOT NULL
-            GROUP BY topic, scope ORDER BY n DESC LIMIT 15
-            """
-        ).fetchall()
-    )
-
-    # Anonymize channel names for public display - chat_name often contains a real
-    # analyst's name, and this dashboard is published (see docs/index.html).
+# ---------------------------------------------------------------------------
+# Content assembly
+# ---------------------------------------------------------------------------
+def _anon_channels(conn) -> dict[int, str]:
     chat_ids = [r[0] for r in conn.execute("SELECT DISTINCT chat_id FROM items ORDER BY chat_id").fetchall()]
-    anon_channel = {chat_id: f"채널{i + 1}" for i, chat_id in enumerate(chat_ids)}
+    return {chat_id: f"채널{i + 1}" for i, chat_id in enumerate(chat_ids)}
 
-    channel_rows = "".join(
-        f"<tr><td>{anon_channel[chat_id]}</td><td class='mono'>{n}</td><td class='mono'>{s}</td></tr>"
-        for chat_id, n, s in conn.execute(
-            """
-            SELECT chat_id, COUNT(*),
-                   SUM(CASE WHEN sentiment_score IS NOT NULL THEN 1 ELSE 0 END)
-            FROM items GROUP BY chat_id ORDER BY 2 DESC
-            """
-        ).fetchall()
+
+def build_content(conn, prices_db: str, ewma_span: int) -> str:
+    anon = _anon_channels(conn)
+
+    # -- scores with item date/chat, direction not null (broad set, for
+    #    histogram/heatmap/channel calibration - NOT the index-eligible set)
+    scores_raw = pd.read_sql_query(
+        """
+        SELECT s.chat_id, s.level, s.direction, s.magnitude, s.confidence, s.novelty,
+               substr(i.date, 1, 10) AS date
+        FROM scores s
+        JOIN (SELECT chat_id, message_id, MAX(scored_at) AS m FROM scores GROUP BY chat_id, message_id) latest
+          ON s.chat_id = latest.chat_id AND s.message_id = latest.message_id AND s.scored_at = latest.m
+        JOIN items i ON i.chat_id = s.chat_id AND i.message_id = s.message_id
+        WHERE s.direction IS NOT NULL
+        """,
+        conn,
     )
+    scores_raw["score"] = scores_raw["direction"] * scores_raw["magnitude"]
+    scores_raw["channel"] = scores_raw["chat_id"].map(anon)
 
-    latest_score = daily["avg_score"].iloc[-1] if not daily.empty else None
-    latest_label = f"{latest_score:+.2f}" if latest_score is not None else "—"
-    days_done = len(daily)
-    pct = scored / total * 100 if total else 0
+    # -- the index-eligible set (index.py's own default filters)
+    idx_all = daily_index(conn, level=None, method="shrinkage")
 
-    if daily.empty:
-        chart_card = '<div class="chart-card"><h2>일별 시장 심리 점수</h2><p>아직 점수가 매겨진 날짜가 없습니다.</p></div>'
-        scope_chart_card = ""
+    # -- market proxy, if reachable
+    market_df = None
+    market_note = None
+    try:
+        prices = market.load_prices(prices_db)
+        if not prices.empty:
+            market_df = market.market_proxy(prices)
+    except Exception as e:
+        market_note = f"시장 데이터를 불러오지 못했습니다 ({e}). --prices-db로 경로를 지정하세요."
+
+    # ---- stats strip ----
+    total_items = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+    scorable = conn.execute(
+        "SELECT COUNT(*) FROM items WHERE text IS NOT NULL OR extracted_text IS NOT NULL"
+    ).fetchone()[0]
+    scored_ok = conn.execute(
+        """
+        SELECT COUNT(*) FROM scores s
+        JOIN (SELECT chat_id, message_id, MAX(scored_at) AS m FROM scores GROUP BY chat_id, message_id) latest
+          ON s.chat_id = latest.chat_id AND s.message_id = latest.message_id AND s.scored_at = latest.m
+        WHERE s.direction IS NOT NULL
+        """
+    ).fetchone()[0]
+    coverage_pct = scored_ok / scorable * 100 if scorable else 0
+
+    extract_incomplete = conn.execute(
+        "SELECT COUNT(*) FROM items WHERE type IN ('document','photo') AND (extract_status IS NULL OR extract_status != 'ok')"
+    ).fetchone()[0]
+
+    from index import _scored_items  # internal helper, reused here rather than duplicated
+
+    valid_df = _scored_items(conn, None, include_recap=False)
+    n_valid = len(valid_df)
+
+    median_n = idx_all["n_items"].median() if not idx_all.empty else 0
+
+    stat_html = f"""
+    <div class="stat-strip">
+      <div class="stat"><span class="label">채점 커버리지</span><span class="value">{coverage_pct:.1f}%</span></div>
+      <div class="stat"><span class="label">추출 미완료(scanned/pending/error)</span><span class="value">{extract_incomplete:,}건</span></div>
+      <div class="stat"><span class="label">recap 제외 후 유효 항목</span><span class="value">{n_valid:,}건</span></div>
+      <div class="stat"><span class="label">일별 표본수 중앙값</span><span class="value">{median_n:.0f}건</span></div>
+    </div>
+    """
+
+    # ---- chart cards ----
+    cards = []
+
+    fig1 = build_index_vs_market_fig(idx_all, market_df, ewma_span)
+    cards.append(f'<div class="chart-card"><h2>1. 감성지수 vs 시장 대용치</h2><div class="plot-wrap">{_to_html(fig1)}</div>'
+                 + (f'<p class="note">{market_note}</p>' if market_note else '') + '</div>')
+
+    if market_df is not None and not idx_all.empty:
+        idx_s = idx_all.set_index("date")["index_value"]
+        idx_s.index = pd.to_datetime(idx_s.index)
+        mkt_s = market_df.set_index("date")["market_return"]
+        fig2, leadlag_df = build_leadlag_fig(idx_s, mkt_s)
+        cards.append(f'<div class="chart-card"><h2>2. Lead-lag 상관</h2><div class="plot-wrap">{_to_html(fig2)}</div>'
+                     f'<p class="note">11개 lag를 동시에 검정하는 다중비교입니다 - 낱개 lag의 유의성만으로 결론 내리지 마세요.</p></div>')
+
+    fig3 = build_score_hist_fig(scores_raw)
+    n_pos_stock = int(((scores_raw["level"] == "stock") & (scores_raw["score"] > 0)).sum())
+    n_neg_stock = int(((scores_raw["level"] == "stock") & (scores_raw["score"] < 0)).sum())
+    cards.append(f'<div class="chart-card"><h2>3. 점수 분포</h2><div class="plot-wrap">{_to_html(fig3)}</div>'
+                 f'<p class="note">개별종목(stock) 항목: 긍정 {n_pos_stock}건 vs 부정 {n_neg_stock}건 - 발신 채널이 호재 위주로 게시하는 경향을 반영할 수 있습니다.</p></div>')
+
+    fig4 = build_heatmap_fig(scores_raw[["level", "score", "date"]])
+    cards.append(f'<div class="chart-card"><h2>4. level × 주간 히트맵</h2><div class="plot-wrap">{_to_html(fig4)}</div></div>')
+
+    channel_stats = (
+        scores_raw.groupby("channel")
+        .agg(avg_score=("score", "mean"), n_scored=("score", "size"))
+        .reset_index()
+    )
+    total_by_channel = (
+        pd.read_sql_query("SELECT chat_id, COUNT(*) AS n_total FROM items GROUP BY chat_id", conn)
+        .assign(channel=lambda d: d["chat_id"].map(anon))
+    )
+    channel_stats = channel_stats.merge(total_by_channel[["channel", "n_total"]], on="channel", how="left")
+    channel_stats["coverage_pct"] = channel_stats["n_scored"] / channel_stats["n_total"] * 100
+    fig5 = build_channel_fig(channel_stats)
+    cards.append(f'<div class="chart-card"><h2>5. 채널별 논조 캘리브레이션</h2><div class="plot-wrap">{_to_html(fig5)}</div></div>')
+
+    fig7, ev_note = build_event_study_fig(conn, prices_db)
+    if fig7 is not None:
+        cards.append(f'<div class="chart-card"><h2>6. 이벤트 스터디 (CAR)</h2><div class="plot-wrap">{_to_html(fig7)}</div></div>')
     else:
-        fig = build_sentiment_fig(daily)
-        chart_card = (
-            f'<div class="chart-card"><h2>일별 시장 심리 점수</h2><div class="plot-wrap">'
-            f'{pio.to_html(fig, include_plotlyjs=False, full_html=False)}</div></div>'
-        )
-        scope_fig = build_scope_fig(scope_daily)
-        scope_chart_card = (
-            f'<div class="chart-card"><h2>범위별 심리 점수</h2><div class="plot-wrap">'
-            f'{pio.to_html(scope_fig, include_plotlyjs=False, full_html=False)}</div></div>'
-        )
+        cards.append(f'<div class="chart-card"><h2>6. 이벤트 스터디 (CAR)</h2><p class="note">{ev_note}</p></div>')
+
+    # ---- item table: last 150, client-side filtered ----
+    items_json = json.loads(
+        pd.read_sql_query(
+            """
+            SELECT substr(i.date,1,10) AS date, s.chat_id, s.level, s.driver, s.novelty,
+                   s.direction, s.magnitude, s.summary
+            FROM scores s
+            JOIN (SELECT chat_id, message_id, MAX(scored_at) AS m FROM scores GROUP BY chat_id, message_id) latest
+              ON s.chat_id = latest.chat_id AND s.message_id = latest.message_id AND s.scored_at = latest.m
+            JOIN items i ON i.chat_id = s.chat_id AND i.message_id = s.message_id
+            WHERE s.direction IS NOT NULL
+            ORDER BY i.date DESC LIMIT 150
+            """,
+            conn,
+        ).assign(
+            channel=lambda d: d["chat_id"].map(anon),
+            score=lambda d: d["direction"] * d["magnitude"],
+        )[["date", "channel", "level", "driver", "novelty", "score", "summary"]].to_json(orient="records")
+    )
+    items_js = json.dumps(items_json, ensure_ascii=False)
+
+    channels_present = sorted(scores_raw["channel"].dropna().unique().tolist())
+    channel_options = "".join(f'<option value="{c}">{c}</option>' for c in channels_present)
+    level_options = "".join(f'<option value="{lv}">{LEVEL_LABELS[lv]}</option>' for lv in LEVELS)
+
+    table_section = f"""
+    <div class="card">
+      <h2>최근 채점 항목 (최근 150건)</h2>
+      <div class="filters">
+        <select id="f-channel"><option value="">채널 전체</option>{channel_options}</select>
+        <select id="f-level"><option value="">범위 전체</option>{level_options}</select>
+        <input id="f-date" type="text" placeholder="날짜 검색 (YYYY-MM-DD)">
+      </div>
+      <div style="overflow-x:auto">
+        <table id="items-table">
+          <thead><tr><th class="left">날짜</th><th class="left">채널</th><th class="left">범위</th><th class="left">동인</th><th>점수</th><th class="left">요약</th></tr></thead>
+          <tbody id="items-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+    <script>
+    const ITEMS = {items_js};
+    const LEVEL_LABELS = {json.dumps(LEVEL_LABELS, ensure_ascii=False)};
+    function renderItems() {{
+      var ch = document.getElementById('f-channel').value;
+      var lv = document.getElementById('f-level').value;
+      var dt = document.getElementById('f-date').value.trim();
+      var rows = ITEMS.filter(function (it) {{
+        if (ch && it.channel !== ch) return false;
+        if (lv && it.level !== lv) return false;
+        if (dt && (it.date || '').indexOf(dt) === -1) return false;
+        return true;
+      }});
+      var body = document.getElementById('items-tbody');
+      body.innerHTML = rows.map(function (it) {{
+        var score = (it.score === null || it.score === undefined) ? '-' : (it.score > 0 ? '+' : '') + it.score;
+        var chip = it.score > 0 ? 'pos' : (it.score < 0 ? 'neg' : 'neu');
+        var lvLabel = LEVEL_LABELS[it.level] || (it.level || '-');
+        return '<tr><td class="left">' + (it.date || '') + '</td><td class="left">' + it.channel +
+               '</td><td class="left">' + lvLabel + '</td><td class="left">' + (it.driver || '-') +
+               '</td><td><span class="chip ' + chip + '">' + score + '</span></td><td class="left">' + (it.summary || '') + '</td></tr>';
+      }}).join('');
+    }}
+    document.getElementById('f-channel').addEventListener('change', renderItems);
+    document.getElementById('f-level').addEventListener('change', renderItems);
+    document.getElementById('f-date').addEventListener('input', renderItems);
+    renderItems();
+    </script>
+    """
+
+    cards_html = "".join(cards)
 
     return f"""
 {STYLE}
 <div class="page">
   <div>
-    <p class="eyebrow">Research Digest · Sentiment</p>
+    <p class="eyebrow">Research Digest · Sentiment v2</p>
     <h1>증권사 리서치 다이제스트</h1>
-    <p class="meta">텔레그램 채널 6곳에서 수집 · 생성 시각 {pd.Timestamp.now():%Y-%m-%d %H:%M}</p>
+    <p class="meta">텔레그램 채널 {len(channels_present)}곳 · 생성 시각 {pd.Timestamp.now():%Y-%m-%d %H:%M}</p>
   </div>
 
-  <div class="stat-strip">
-    <div class="stat"><span class="label">전체 수집</span><span class="value">{total:,}건</span></div>
-    <div class="stat"><span class="label">점수 매김</span><span class="value">{scored:,}건 ({pct:.1f}%)</span></div>
-    <div class="stat"><span class="label">처리된 날짜 수</span><span class="value">{days_done}일</span></div>
-    <div class="stat"><span class="label">최근 처리일 점수</span><span class="value">{latest_label}</span></div>
-  </div>
+  {stat_html}
 
-  {chart_card}
-  {scope_chart_card}
+  {cards_html}
 
   <div class="card">
-    <h2>채점 기준</h2>
-    <p><strong>Gemini API</strong>(<code>summarize.py</code>)가 하루치 항목을 한 번에 읽고 자동으로 채점합니다.
-    사람이 매번 읽는 게 아니라, 미리 정한 기준(system instruction)을 프롬프트로 주고 구조화된 JSON으로
-    결과를 받는 방식이에요. 각 항목에 대해 그 내용이 <strong>그날 시장 심리에 얼마나 긍정적/부정적인 재료인지</strong>를
-    -5(매우 부정)부터 +5(매우 긍정)까지 정수로 판단합니다. 단순 사전(키워드) 기반이 아니라 지수 등락·실적·정책
-    발언 등 맥락을 함께 고려하도록 지시되어 있습니다. 일별 점수는 그날 채점된 항목 점수의
-    <strong>단순 평균</strong>입니다. 정확한 프롬프트 원문은 저장소의 <code>summarize.py</code> 안 <code>RUBRIC</code>을 참고하세요.</p>
-    <p style="margin-top:0.75rem">내용만으로 판단이 애매한 항목(예: 맥락 없는 링크 하나만 있는 경우)은 억지로
-    점수를 매기지 않고 <strong>결측치(빈 값)</strong>로 남겨둡니다 — 그래프와 통계에는 잡히지 않아요.</p>
+    <h2>채점 기준 (v2)</h2>
+    <p>각 항목을 Gemini API(<code>score_llm.py</code>)가 읽고 여러 축으로 분해해서 구조화된 JSON으로 반환합니다.
+    <strong>direction</strong>(-1/0/+1, 방향)과 <strong>magnitude</strong>(0-3, 강도)를 곱한 값이 최종 점수(-3..+3)입니다.
+    <strong>confidence</strong>(0-1)는 판단 확신도, <strong>level</strong>은 매크로/시장/섹터/종목 층위,
+    <strong>driver</strong>는 근본 동인(통화정책/실적/수급/지정학/환율/규제/밸류에이션/공급망/원자재/기타),
+    <strong>novelty</strong>는 새 정보(new)/사후요약(recap)/재게시(repost) 구분, <strong>horizon</strong>은 영향 시간범위입니다.
+    판단이 애매한 항목은 억지로 채점하지 않고 direction을 결측치(null)로 남깁니다.</p>
     <div class="scale">
-      <span class="band">-5·-4 매우 부정 (급락/위기)</span>
-      <span class="band">-3·-2 부정 (하락·우려 지배적)</span>
-      <span class="band">-1 약한 부정/경계</span>
-      <span class="band">0 중립/정보성</span>
-      <span class="band">+1 약한 긍정</span>
-      <span class="band">+2·+3 긍정 (실적 서프라이즈 등)</span>
-      <span class="band">+4·+5 매우 긍정 (사상 최대 등)</span>
+      <span class="band">score = direction × magnitude (-3..+3)</span>
+      <span class="band">recap 항목은 지수 집계에서 기본 제외 (사후요약 순환참조 방지)</span>
+      <span class="band">confidence &lt; 0.4 항목도 지수 집계에서 제외</span>
     </div>
-    <p style="margin-top:1rem">점수와 별개로 각 항목은 <strong>범위(scope)</strong>도 함께 분류합니다 — 뉴스가
-    작동하는 층위가 다르면 같은 "부정적" 재료도 의미가 다르기 때문입니다:</p>
-    <div class="scale">
-      <span class="band">macro 거시/통화정책/지정학/환율 등 시장 전체에 영향</span>
-      <span class="band">market 코스피·코스닥 등 시장 전반 시황</span>
-      <span class="band">sector 업종·산업 단위 (반도체, 은행 등)</span>
-      <span class="band">stock 개별 종목 재료</span>
-    </div>
-    <p style="margin-top:0.75rem">주제(topic)는 "금리정책", "삼성전자"처럼 자유 태그로 붙여, 같은 주제가 반복
-    언급되는지 나중에 추적할 수 있게 합니다.</p>
+    <h2 style="margin-top:1.5rem">한계</h2>
+    <ul class="limits">
+      <li><strong>발신자 편향</strong>: 종목(stock) 레벨 항목은 위 분포 차트에서 보듯 긍정 편향이 뚜렷합니다 - 리서치 채널이 매수의견/호재 위주로 게시하는 경향의 결과로 보입니다.</li>
+      <li><strong>채널 커버리지 불균등</strong>: 채널별 캘리브레이션 차트에서 보듯 채널마다 게시량·채점률 편차가 큽니다. 특정 채널의 논조가 전체 지수를 과대표현할 수 있습니다.</li>
+      <li><strong>시장 대용치의 근사성</strong>: KOSPI 지수 자체가 아니라 가격이력이 충분한 종목들의 동일가중 수익률 근사치입니다 (market.py 참고). 시가총액 가중이 아니므로 실제 지수와 괴리가 있을 수 있습니다.</li>
+      <li>이 대시보드는 어떤 상관관계도 "예측력 있음"으로 단정하지 않습니다 - lead-lag/이벤트 스터디 결과를 있는 그대로 표시할 뿐입니다.</li>
+    </ul>
   </div>
 
-  <div class="card">
-    <h2>범위별 요약</h2>
-    <table><tr><th>범위</th><th>건수</th><th>평균 점수</th></tr>{scope_summary_rows}</table>
-  </div>
-
-  <div class="card">
-    <h2>자주 언급된 주제 (상위 15)</h2>
-    <table><tr><th>주제</th><th>범위</th><th>건수</th><th>평균 점수</th></tr>{topic_rows}</table>
-  </div>
-
-  <div class="card">
-    <h2>채널별 진행 현황</h2>
-    <table><tr><th>채널</th><th>수집</th><th>점수매김</th></tr>{channel_rows}</table>
-  </div>
+  {table_section}
 
   <footer>
-    <code>python summarize.py</code>가 새로 수집된 항목을 자동으로 채점합니다.
-    사진/PDF 캡션이 없는 항목과, 내용만으로 판단이 애매한 항목은 결측치로 남습니다.
+    <code>python collect.py &amp;&amp; python extract.py &amp;&amp; python score_llm.py &amp;&amp; python dashboard.py</code>
+    로 매일 갱신됩니다. 채점 기준 원문은 <code>rubric.py</code>, 검증 로직은 <code>validate.py</code>를 참고하세요.
   </footer>
 </div>
+{THEME_SCRIPT}
 """
 
 
-def render_dashboard(conn) -> str:
-    content = build_content(conn)
+def render_dashboard(conn, prices_db: str, ewma_span: int, embed_plotly: bool) -> str:
+    content = build_content(conn, prices_db, ewma_span)
+    if embed_plotly:
+        from plotly.offline import get_plotlyjs
+        plotly_tag = f"<script>{get_plotlyjs()}</script>"
+    else:
+        plotly_tag = f'<script src="{PLOTLY_CDN}" charset="utf-8"></script>'
+
     return f"""<!doctype html>
 <html lang="ko">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>증권사 리서치 다이제스트</title>
-<script>{get_plotlyjs()}</script>
+{plotly_tag}
 </head>
 <body>
 {content}
@@ -349,17 +640,17 @@ def render_dashboard(conn) -> str:
 </html>"""
 
 
-DOCS_DIR = Path(__file__).parent / "docs"
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", default=None, help="Output HTML path (default: output/dashboard.html)")
     parser.add_argument("--no-docs", action="store_true", help="Skip writing docs/index.html (GitHub Pages source)")
+    parser.add_argument("--prices-db", default=str(market.DEFAULT_PRICES_DB), help="Path to companion prices.db")
+    parser.add_argument("--ewma-span", type=int, default=10, help="EWMA span for the sentiment line (default 10)")
+    parser.add_argument("--embed-plotly", action="store_true", help="Inline plotly.js instead of CDN (offline use, larger file)")
     args = parser.parse_args()
 
     conn = get_connection()
-    html = render_dashboard(conn)
+    html = render_dashboard(conn, args.prices_db, args.ewma_span, args.embed_plotly)
     conn.close()
 
     out_path = Path(args.out) if args.out else OUT / "dashboard.html"
