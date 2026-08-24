@@ -5,6 +5,8 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import pandas as pd
+
 DB_PATH = Path(__file__).parent / "digest.db"
 
 SCHEMA = """
@@ -34,10 +36,45 @@ CREATE TABLE IF NOT EXISTS items (
 SCOPES = ("macro", "market", "sector", "stock")
 EXTRACT_STATUSES = ("ok", "scanned", "image_pending", "no_file", "error")
 
+# scores is a separate, versioned table (not columns on items) so a rubric
+# change never overwrites what an older rubric said about the same item -
+# old and new scores stay comparable side by side. score itself (-3..+3) is
+# never stored: it's always direction*magnitude, derived on read in
+# latest_scores(), so rescaling the rubric later needs no backfill.
+SCORES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS scores (
+    chat_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    rubric_version TEXT NOT NULL,   -- e.g. 'v1'
+    model TEXT NOT NULL,            -- e.g. 'gemini-2.5-flash'
+    direction INTEGER,              -- -1 | 0 | +1
+    magnitude INTEGER,              -- 0..3
+    confidence REAL,                -- 0..1
+    level TEXT,                     -- 'macro' | 'market' | 'sector' | 'stock'
+    sector_code TEXT,               -- KRX sector code (fixed enum), NULL if n/a
+    ticker TEXT,                    -- 6-digit code, only if explicitly named
+    driver TEXT,                    -- fixed enum, see DRIVERS
+    novelty TEXT,                   -- 'new' | 'recap' | 'repost'
+    horizon TEXT,                   -- 'intraday' | 'short' | 'medium'
+    summary TEXT,
+    raw_response TEXT,              -- raw LLM response, verbatim
+    scored_at TEXT NOT NULL,
+    PRIMARY KEY (chat_id, message_id, rubric_version)
+);
+"""
+
+DRIVERS = (
+    "monetary_policy", "earnings", "flows", "geopolitics", "fx",
+    "regulation", "valuation", "supply_chain", "commodity", "other",
+)
+NOVELTY_VALUES = ("new", "recap", "repost")
+HORIZON_VALUES = ("intraday", "short", "medium")
+
 
 def get_connection(db_path: Path | str = DB_PATH) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.execute(SCHEMA)
+    conn.execute(SCORES_SCHEMA)
     existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(items)")}
     if "sentiment_score" not in existing_cols:
         conn.execute("ALTER TABLE items ADD COLUMN sentiment_score REAL")
@@ -103,6 +140,85 @@ def scoring_input(row: sqlite3.Row) -> str:
     no caption - always score through this function instead."""
     parts = [row["text"] or "", row["extracted_text"] or ""]
     return "\n\n".join(p for p in parts if p).strip()
+
+
+def upsert_score(
+    conn: sqlite3.Connection,
+    chat_id: int,
+    message_id: int,
+    rubric_version: str,
+    model: str,
+    *,
+    direction: int | None = None,
+    magnitude: int | None = None,
+    confidence: float | None = None,
+    level: str | None = None,
+    sector_code: str | None = None,
+    ticker: str | None = None,
+    driver: str | None = None,
+    novelty: str | None = None,
+    horizon: str | None = None,
+    summary: str | None = None,
+    raw_response: str | None = None,
+    scored_at: str | None = None,
+) -> None:
+    if driver is not None:
+        assert driver in DRIVERS, f"driver must be one of {DRIVERS}, got {driver!r}"
+    if level is not None:
+        assert level in SCOPES, f"level must be one of {SCOPES}, got {level!r}"
+    if novelty is not None:
+        assert novelty in NOVELTY_VALUES, f"novelty must be one of {NOVELTY_VALUES}, got {novelty!r}"
+    if horizon is not None:
+        assert horizon in HORIZON_VALUES, f"horizon must be one of {HORIZON_VALUES}, got {horizon!r}"
+
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO scores
+            (chat_id, message_id, rubric_version, model, direction, magnitude,
+             confidence, level, sector_code, ticker, driver, novelty, horizon,
+             summary, raw_response, scored_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')))
+        """,
+        (
+            chat_id, message_id, rubric_version, model, direction, magnitude,
+            confidence, level, sector_code, ticker, driver, novelty, horizon,
+            summary, raw_response, scored_at,
+        ),
+    )
+    conn.commit()
+
+
+def latest_scores(conn: sqlite3.Connection, rubric_version: str | None = None) -> pd.DataFrame:
+    """Scores as a DataFrame, with `score` (direction*magnitude, -3..+3)
+    computed on read - the scale is never persisted, so a future rubric
+    tweak needs no backfill migration.
+
+    rubric_version=None returns each item's most recently scored row (by
+    scored_at) regardless of which rubric produced it - use this for "what
+    do we currently believe"; pass an explicit version to compare rubrics
+    against each other for the same items.
+    """
+    if rubric_version:
+        df = pd.read_sql_query(
+            "SELECT * FROM scores WHERE rubric_version = ?", conn, params=(rubric_version,)
+        )
+    else:
+        df = pd.read_sql_query(
+            """
+            SELECT s.* FROM scores s
+            JOIN (
+                SELECT chat_id, message_id, MAX(scored_at) AS max_scored_at
+                FROM scores GROUP BY chat_id, message_id
+            ) latest
+              ON s.chat_id = latest.chat_id
+             AND s.message_id = latest.message_id
+             AND s.scored_at = latest.max_scored_at
+            """,
+            conn,
+        )
+    if not df.empty:
+        df["score"] = df["direction"] * df["magnitude"]
+    return df
 
 
 def last_message_id(conn: sqlite3.Connection, chat_id: int) -> int:
