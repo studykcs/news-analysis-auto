@@ -61,11 +61,18 @@ def _scored_items(conn, level: str | None, include_recap: bool) -> pd.DataFrame:
 
     Reads the *latest* score per item (whatever rubric_version last touched
     it) via the same join pattern as store.latest_scores(), then joins back
-    to items for the date and chat_id.
+    to items for the date, chat_id, and dedup info.
+
+    Filters to is_cluster_head=1 by default (or NULL, for items scored
+    before dedupe.py ever ran on them / a DB where it's never been run -
+    that's "not deduplicated yet", not "not a duplicate") - see dedupe.py:
+    a story six channels all mention would otherwise count six times in
+    every daily aggregate below, dominating the mean.
     """
     query = """
         SELECT i.chat_id AS chat_id, substr(i.date, 1, 10) AS date,
-               s.level, s.direction, s.magnitude, s.confidence, s.novelty
+               s.level, s.direction, s.magnitude, s.confidence, s.novelty,
+               i.mention_channels
         FROM scores s
         JOIN (
             SELECT chat_id, message_id, MAX(scored_at) AS max_scored_at
@@ -76,6 +83,7 @@ def _scored_items(conn, level: str | None, include_recap: bool) -> pd.DataFrame:
         JOIN items i ON i.chat_id = s.chat_id AND i.message_id = s.message_id
         WHERE s.direction IS NOT NULL
           AND (s.confidence IS NULL OR s.confidence >= ?)
+          AND (i.is_cluster_head = 1 OR i.is_cluster_head IS NULL)
     """
     params: list = [MIN_CONFIDENCE]
     if not include_recap:
@@ -91,39 +99,61 @@ def _scored_items(conn, level: str | None, include_recap: bool) -> pd.DataFrame:
     return df
 
 
-def _shrinkage(df: pd.DataFrame, k: float) -> pd.DataFrame:
-    g = df.groupby("date")
-    out = g["score"].mean().rename("mean_score").to_frame()
+def _weighted_avg(values: pd.Series, weights: pd.Series) -> float:
+    wsum = weights.sum()
+    return (values * weights).sum() / wsum if wsum else values.mean()
+
+
+def _consensus_weight(df: pd.DataFrame, weight_by_consensus: bool) -> pd.Series:
+    """1 per item normally; mention_channels per item when
+    --weight-by-consensus opts in (a story more channels independently
+    covered counts for more, not less - see dedupe.py's module docstring
+    on why duplicates are a feature, not noise to discard)."""
+    if not weight_by_consensus:
+        return pd.Series(1.0, index=df.index)
+    return df["mention_channels"].fillna(1).astype(float)
+
+
+def _shrinkage(df: pd.DataFrame, k: float, weight_by_consensus: bool) -> pd.DataFrame:
+    w = _consensus_weight(df, weight_by_consensus)
+    d = df.assign(_w=w)
+    g = d.groupby("date")
+    mean_score = g.apply(lambda x: _weighted_avg(x["score"], x["_w"]), include_groups=False)
+    out = mean_score.rename("mean_score").to_frame()
     out["n_items"] = g.size()
     out["n_channels"] = g["chat_id"].nunique()
     out["index_value"] = out["n_items"] / (out["n_items"] + k) * out["mean_score"]
     return out[["index_value", "n_items", "n_channels"]]
 
 
-def _channel_demeaned(df: pd.DataFrame) -> pd.DataFrame:
+def _channel_demeaned(df: pd.DataFrame, weight_by_consensus: bool) -> pd.DataFrame:
     channel_mean = df.groupby("chat_id")["score"].transform("mean")
-    demeaned = df.assign(demeaned_score=df["score"] - channel_mean)
+    w = _consensus_weight(df, weight_by_consensus)
+    demeaned = df.assign(demeaned_score=df["score"] - channel_mean, _w=w)
     g = demeaned.groupby("date")
-    out = g["demeaned_score"].mean().rename("index_value").to_frame()
+    index_value = g.apply(lambda x: _weighted_avg(x["demeaned_score"], x["_w"]), include_groups=False)
+    out = index_value.rename("index_value").to_frame()
     out["n_items"] = g.size()
     out["n_channels"] = g["chat_id"].nunique()
     return out[["index_value", "n_items", "n_channels"]]
 
 
-def _breadth(df: pd.DataFrame) -> pd.DataFrame:
-    g = df.groupby("date")
-    pos = g.apply(lambda d: (d["score"] > 0).sum(), include_groups=False)
-    neg = g.apply(lambda d: (d["score"] < 0).sum(), include_groups=False)
-    n = g.size()
-    out = pd.DataFrame({"index_value": (pos - neg) / n, "n_items": n})
+def _breadth(df: pd.DataFrame, weight_by_consensus: bool = False) -> pd.DataFrame:
+    w = _consensus_weight(df, weight_by_consensus)
+    d = df.assign(_w=w)
+    g = d.groupby("date")
+    pos = g.apply(lambda x: x.loc[x["score"] > 0, "_w"].sum(), include_groups=False)
+    neg = g.apply(lambda x: x.loc[x["score"] < 0, "_w"].sum(), include_groups=False)
+    total_w = g["_w"].sum()
+    out = pd.DataFrame({"index_value": (pos - neg) / total_w, "n_items": g.size()})
     out["n_channels"] = g["chat_id"].nunique()
     return out[["index_value", "n_items", "n_channels"]]
 
 
 _METHOD_FUNCS = {
-    "shrinkage": lambda df, k: _shrinkage(df, k),
-    "channel_demeaned": lambda df, k: _channel_demeaned(df),
-    "breadth": lambda df, k: _breadth(df),
+    "shrinkage": lambda df, k, wc: _shrinkage(df, k, wc),
+    "channel_demeaned": lambda df, k, wc: _channel_demeaned(df, wc),
+    "breadth": lambda df, k, wc: _breadth(df, wc),
 }
 
 
@@ -133,20 +163,22 @@ def daily_index(
     method: str = "shrinkage",
     shrink_k: float = DEFAULT_SHRINK_K,
     include_recap: bool = False,
+    weight_by_consensus: bool = False,
 ) -> pd.DataFrame:
     """One row per date. Columns: date, index_value, n_items, n_channels, breadth.
 
     breadth is always included (even for method != 'breadth') as a cheap
     cross-check - if shrinkage/channel_demeaned and breadth disagree in
-    sign, that's worth noticing before trusting either.
+    sign, that's worth noticing before trusting either. n_items always
+    counts deduplicated items (cluster heads), never raw per-channel posts.
     """
     assert method in METHODS, f"method must be one of {METHODS}, got {method!r}"
     df = _scored_items(conn, level, include_recap)
     if df.empty:
         return pd.DataFrame(columns=["date", "index_value", "n_items", "n_channels", "breadth"])
 
-    result = _METHOD_FUNCS[method](df, shrink_k)
-    breadth = _breadth(df)["index_value"].rename("breadth")
+    result = _METHOD_FUNCS[method](df, shrink_k, weight_by_consensus)
+    breadth = _breadth(df, weight_by_consensus)["index_value"].rename("breadth")
     result = result.join(breadth, how="left")
     return result.reset_index().sort_values("date")
 
@@ -157,6 +189,7 @@ def weighted_composite(
     method: str = "shrinkage",
     shrink_k: float = DEFAULT_SHRINK_K,
     include_recap: bool = False,
+    weight_by_consensus: bool = False,
 ) -> pd.DataFrame:
     """Explicit-weight blend across levels - never computed implicitly.
     weights must be a dict like {'macro': 0.4, 'market': 0.3, ...}; levels
@@ -168,7 +201,10 @@ def weighted_composite(
 
     per_level = {}
     for level, w in weights.items():
-        per_level[level] = daily_index(conn, level=level, method=method, shrink_k=shrink_k, include_recap=include_recap)
+        per_level[level] = daily_index(
+            conn, level=level, method=method, shrink_k=shrink_k,
+            include_recap=include_recap, weight_by_consensus=weight_by_consensus,
+        )
 
     all_dates = sorted(set().union(*(df["date"] for df in per_level.values())))
     rows = []
@@ -206,6 +242,10 @@ def main() -> None:
     parser.add_argument("--shrink-k", type=float, default=DEFAULT_SHRINK_K)
     parser.add_argument("--include-recap", action="store_true", help="Include novelty='recap' items (comparison run)")
     parser.add_argument("--weights", help="Explicit composite, e.g. macro=0.4,market=0.3,sector=0.2,stock=0.1")
+    parser.add_argument(
+        "--weight-by-consensus", action="store_true",
+        help="Weight each (deduplicated) story by mention_channels - see dedupe.py",
+    )
     parser.add_argument("--out", help="Write CSV to this path instead of printing")
     args = parser.parse_args()
 
@@ -215,6 +255,7 @@ def main() -> None:
         df = weighted_composite(
             conn, parse_weights(args.weights), method=args.method,
             shrink_k=args.shrink_k, include_recap=args.include_recap,
+            weight_by_consensus=args.weight_by_consensus,
         )
         label = f"weighted composite ({args.weights})"
         _emit(df, label, args.out)
@@ -222,7 +263,10 @@ def main() -> None:
 
     levels = [args.level] if args.level else list(LEVELS)
     for level in levels:
-        df = daily_index(conn, level=level, method=args.method, shrink_k=args.shrink_k, include_recap=args.include_recap)
+        df = daily_index(
+            conn, level=level, method=args.method, shrink_k=args.shrink_k,
+            include_recap=args.include_recap, weight_by_consensus=args.weight_by_consensus,
+        )
         out_path = None
         if args.out:
             p = Path(args.out)

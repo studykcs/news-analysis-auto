@@ -184,7 +184,7 @@ def build_index_vs_market_fig(idx: pd.DataFrame, market_df: pd.DataFrame | None,
 
     dates = pd.to_datetime(idx["date"])
     ewma = idx["index_value"].ewm(span=ewma_span, min_periods=1).mean()
-    fig.add_scatter(x=dates, y=ewma, name=f"감성지수 (EWMA{ewma_span})", mode="lines",
+    fig.add_scatter(x=dates, y=ewma, name=f"논조지수 (EWMA{ewma_span})", mode="lines",
                      line=dict(color="#9C6B2E", width=2.4), row=1, col=1, secondary_y=False)
 
     if market_df is not None and not market_df.empty:
@@ -199,11 +199,11 @@ def build_index_vs_market_fig(idx: pd.DataFrame, market_df: pd.DataFrame | None,
 
     fig.update_layout(
         **_fig_layout_base(),
-        title="감성지수(EWMA) vs 시장 대용치 — 위 라인이 시장보다 먼저 움직이는지 3초 안에 비교",
+        title="리서치 채널 논조지수(EWMA) vs 시장 대용치 — 위 라인이 시장보다 먼저 움직이는지 3초 안에 비교",
         height=460, bargap=0.2,
         legend=dict(orientation="h", y=1.12),
     )
-    fig.update_yaxes(title_text="감성지수", row=1, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="논조지수", row=1, col=1, secondary_y=False)
     fig.update_yaxes(title_text="시장 누적수익", row=1, col=1, secondary_y=True, showgrid=False)
     fig.update_yaxes(title_text="표본수", row=2, col=1)
     return fig
@@ -244,7 +244,7 @@ def build_leadlag_fig(idx_series: pd.Series, market_series: pd.Series) -> tuple[
     fig.add_vline(x=0, line_color="#8A8272", line_width=1, line_dash="dot")
     fig.update_layout(
         **_fig_layout_base(),
-        title="Lead-lag 상관: corr(감성지수_t, 시장수익률_t+k) — k&lt;0은 지수가 뒤따라감, k&gt;0은 지수가 앞섬 (95% CI)",
+        title="Lead-lag 상관: corr(논조지수_t, 시장수익률_t+k) — k&lt;0은 지수가 뒤따라감, k&gt;0은 지수가 앞섬 (95% CI)",
         height=340, xaxis_title="k (거래일)", yaxis_title="상관계수",
     )
     return fig, df
@@ -396,6 +396,45 @@ def build_event_study_fig(conn, prices_db: str) -> tuple[go.Figure | None, str |
 
 
 # ---------------------------------------------------------------------------
+# Gemini (v2) vs KR-FinBERT (finbert-v1) comparison, when both exist
+# ---------------------------------------------------------------------------
+def build_finbert_comparison_fig(conn) -> tuple[go.Figure | None, str | None, dict | None]:
+    df = pd.read_sql_query(
+        """
+        SELECT g.direction AS g_dir, g.magnitude AS g_mag, f.direction AS f_dir, f.magnitude AS f_mag
+        FROM scores g
+        JOIN scores f ON f.chat_id = g.chat_id AND f.message_id = g.message_id
+        WHERE g.rubric_version = 'v2' AND f.rubric_version = 'finbert-v1'
+          AND g.direction IS NOT NULL AND f.direction IS NOT NULL
+        """,
+        conn,
+    )
+    if df.empty:
+        return None, "두 rubric(v2, finbert-v1)으로 모두 채점된 항목이 아직 없습니다. score_finbert.py를 실행하세요.", None
+
+    df["g_score"] = df["g_dir"] * df["g_mag"]
+    df["f_score"] = df["f_dir"] * df["f_mag"]
+    n = len(df)
+    dir_agree = (df["g_dir"] == df["f_dir"]).mean()
+    corr = df["g_score"].corr(df["f_score"]) if n >= 3 else float("nan")
+
+    fig = go.Figure()
+    fig.add_scatter(
+        x=df["g_score"], y=df["f_score"], mode="markers",
+        marker=dict(color="#9C6B2E", size=7, opacity=0.55),
+        hovertemplate="Gemini %{x:+.0f} · FinBERT %{y:+.0f}<extra></extra>",
+    )
+    fig.add_hline(y=0, line_color="#8A8272", line_width=1)
+    fig.add_vline(x=0, line_color="#8A8272", line_width=1)
+    fig.update_layout(
+        **_fig_layout_base(),
+        title=f"Gemini(v2) vs FinBERT 점수 비교 — n={n}, 방향 일치율 {dir_agree:.0%}, 상관 {corr:+.2f}",
+        height=340, xaxis_title="Gemini score (direction×magnitude)", yaxis_title="FinBERT score",
+    )
+    return fig, None, {"n": n, "dir_agree": dir_agree, "corr": corr}
+
+
+# ---------------------------------------------------------------------------
 # Content assembly
 # ---------------------------------------------------------------------------
 def _anon_channels(conn) -> dict[int, str]:
@@ -411,12 +450,13 @@ def build_content(conn, prices_db: str, ewma_span: int) -> str:
     scores_raw = pd.read_sql_query(
         """
         SELECT s.chat_id, s.level, s.direction, s.magnitude, s.confidence, s.novelty,
-               substr(i.date, 1, 10) AS date
+               s.rubric_version, i.mention_channels, substr(i.date, 1, 10) AS date
         FROM scores s
         JOIN (SELECT chat_id, message_id, MAX(scored_at) AS m FROM scores GROUP BY chat_id, message_id) latest
           ON s.chat_id = latest.chat_id AND s.message_id = latest.message_id AND s.scored_at = latest.m
         JOIN items i ON i.chat_id = s.chat_id AND i.message_id = s.message_id
         WHERE s.direction IS NOT NULL
+          AND (i.is_cluster_head = 1 OR i.is_cluster_head IS NULL)
         """,
         conn,
     )
@@ -475,7 +515,7 @@ def build_content(conn, prices_db: str, ewma_span: int) -> str:
     cards = []
 
     fig1 = build_index_vs_market_fig(idx_all, market_df, ewma_span)
-    cards.append(f'<div class="chart-card"><h2>1. 감성지수 vs 시장 대용치</h2><div class="plot-wrap">{_to_html(fig1)}</div>'
+    cards.append(f'<div class="chart-card"><h2>1. 논조지수 vs 시장 대용치</h2><div class="plot-wrap">{_to_html(fig1)}</div>'
                  + (f'<p class="note">{market_note}</p>' if market_note else '') + '</div>')
 
     if market_df is not None and not idx_all.empty:
@@ -514,6 +554,12 @@ def build_content(conn, prices_db: str, ewma_span: int) -> str:
         cards.append(f'<div class="chart-card"><h2>6. 이벤트 스터디 (CAR)</h2><div class="plot-wrap">{_to_html(fig7)}</div></div>')
     else:
         cards.append(f'<div class="chart-card"><h2>6. 이벤트 스터디 (CAR)</h2><p class="note">{ev_note}</p></div>')
+
+    fig8, fb_note, fb_stats = build_finbert_comparison_fig(conn)
+    if fig8 is not None:
+        cards.append(f'<div class="chart-card"><h2>Gemini vs FinBERT 비교</h2><div class="plot-wrap">{_to_html(fig8)}</div></div>')
+    else:
+        cards.append(f'<div class="chart-card"><h2>Gemini vs FinBERT 비교</h2><p class="note">{fb_note}</p></div>')
 
     # ---- item table: last 150, client-side filtered ----
     items_json = json.loads(
@@ -591,9 +637,10 @@ def build_content(conn, prices_db: str, ewma_span: int) -> str:
 {STYLE}
 <div class="page">
   <div>
-    <p class="eyebrow">Research Digest · Sentiment v2</p>
-    <h1>증권사 리서치 다이제스트</h1>
-    <p class="meta">텔레그램 채널 {len(channels_present)}곳 · 생성 시각 {pd.Timestamp.now():%Y-%m-%d %H:%M}</p>
+    <p class="eyebrow">Research Digest · Research Tone Index</p>
+    <h1>리서치 채널 논조 지수 (Research Tone Index)</h1>
+    <p class="meta">텔레그램 채널 {len(channels_present)}곳의 논조를 집계한 것으로, 실제 시장 심리를 직접 측정한 값이 아닙니다 ·
+    생성 시각 {pd.Timestamp.now():%Y-%m-%d %H:%M}</p>
   </div>
 
   {stat_html}
@@ -612,12 +659,18 @@ def build_content(conn, prices_db: str, ewma_span: int) -> str:
       <span class="band">score = direction × magnitude (-3..+3)</span>
       <span class="band">recap 항목은 지수 집계에서 기본 제외 (사후요약 순환참조 방지)</span>
       <span class="band">confidence &lt; 0.4 항목도 지수 집계에서 제외</span>
+      <span class="band">동일 사안을 여러 채널이 다루면 dedupe.py가 대표 1건만 집계 (mention_channels로 컨센서스 강도 별도 추적)</span>
     </div>
+    <p style="margin-top:0.75rem">비교용으로 <strong>KR-FinBERT</strong>(<code>score_finbert.py</code>, rubric_version=<code>finbert-v1</code>)도 같은 항목을 채점합니다 -
+    다만 순수 3분류(긍정/중립/부정) 모델이라 level/driver/ticker 등은 만들 수 없어 direction/magnitude/confidence만 채워집니다.
+    아래 "Gemini vs FinBERT 비교" 차트 참고.</p>
     <h2 style="margin-top:1.5rem">한계</h2>
     <ul class="limits">
-      <li><strong>발신자 편향</strong>: 종목(stock) 레벨 항목은 위 분포 차트에서 보듯 긍정 편향이 뚜렷합니다 - 리서치 채널이 매수의견/호재 위주로 게시하는 경향의 결과로 보입니다.</li>
+      <li><strong>발신자 편향</strong>: 종목(stock) 레벨 항목은 위 분포 차트에서 보듯 긍정 편향이 뚜렷합니다 - 리서치 채널이 매수의견/호재 위주로 게시하는 경향의 결과로 보입니다. 그래서 이 지수의 이름도 "시장 심리"가 아니라 <strong>"리서치 채널 논조"</strong>입니다 - 실제로 측정하는 건 시장의 심리가 아니라 이 채널들의 발신 논조입니다.</li>
       <li><strong>채널 커버리지 불균등</strong>: 채널별 캘리브레이션 차트에서 보듯 채널마다 게시량·채점률 편차가 큽니다. 특정 채널의 논조가 전체 지수를 과대표현할 수 있습니다.</li>
       <li><strong>시장 대용치의 근사성</strong>: KOSPI 지수 자체가 아니라 가격이력이 충분한 종목들의 동일가중 수익률 근사치입니다 (market.py 참고). 시가총액 가중이 아니므로 실제 지수와 괴리가 있을 수 있습니다.</li>
+      <li><strong>표본 수 문제</strong>: 일별 표본수 중앙값이 통계 스트립에 표시됩니다 - 표본이 적은 날의 지수는 shrinkage 방식으로 0에 가깝게 눌러도 여전히 노이즈가 큽니다.</li>
+      <li><strong>다중 비교 문제</strong>: lead-lag 차트는 11개 lag를 동시에 검정합니다 - 낱개 lag 하나가 유의해 보여도 우연일 가능성을 배제할 수 없습니다.</li>
       <li>이 대시보드는 어떤 상관관계도 "예측력 있음"으로 단정하지 않습니다 - lead-lag/이벤트 스터디 결과를 있는 그대로 표시할 뿐입니다.</li>
     </ul>
   </div>
@@ -625,8 +678,9 @@ def build_content(conn, prices_db: str, ewma_span: int) -> str:
   {table_section}
 
   <footer>
-    <code>python collect.py &amp;&amp; python extract.py &amp;&amp; python score_llm.py &amp;&amp; python dashboard.py</code>
-    로 매일 갱신됩니다. 채점 기준 원문은 <code>rubric.py</code>, 검증 로직은 <code>validate.py</code>를 참고하세요.
+    <code>collect.py → extract.py → score_llm.py → dedupe.py → index.py → validate.py → dashboard.py</code>
+    순서로 매일 갱신됩니다. 채점 기준 원문은 <code>rubric.py</code>, 검증 로직은 <code>validate.py</code>, 중복 판정은
+    <code>dedupe.py</code>를 참고하세요.
   </footer>
 </div>
 {THEME_SCRIPT}
@@ -646,7 +700,7 @@ def render_dashboard(conn, prices_db: str, ewma_span: int, embed_plotly: bool) -
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>증권사 리서치 다이제스트</title>
+<title>리서치 채널 논조 지수</title>
 {plotly_tag}
 </head>
 <body>

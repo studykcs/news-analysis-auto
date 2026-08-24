@@ -29,6 +29,9 @@ CREATE TABLE IF NOT EXISTS items (
     extract_status TEXT,         -- 'ok' | 'scanned' | 'image_pending' | 'no_file' | 'error'
     extracted_at TEXT,
     extract_chars INTEGER,       -- len(extracted_text), for quality monitoring
+    dup_cluster_id TEXT,         -- set by dedupe.py; shared by every item judged a near-duplicate
+    is_cluster_head INTEGER,     -- 1 for the one representative item per cluster, else 0
+    mention_channels INTEGER,    -- distinct chat_id count in this item's cluster (consensus strength)
     PRIMARY KEY (chat_id, message_id)
 );
 """
@@ -90,6 +93,12 @@ def get_connection(db_path: Path | str = DB_PATH) -> sqlite3.Connection:
         conn.execute("ALTER TABLE items ADD COLUMN extracted_at TEXT")
     if "extract_chars" not in existing_cols:
         conn.execute("ALTER TABLE items ADD COLUMN extract_chars INTEGER")
+    if "dup_cluster_id" not in existing_cols:
+        conn.execute("ALTER TABLE items ADD COLUMN dup_cluster_id TEXT")
+    if "is_cluster_head" not in existing_cols:
+        conn.execute("ALTER TABLE items ADD COLUMN is_cluster_head INTEGER")
+    if "mention_channels" not in existing_cols:
+        conn.execute("ALTER TABLE items ADD COLUMN mention_channels INTEGER")
     return conn
 
 

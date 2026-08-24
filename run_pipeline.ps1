@@ -9,6 +9,7 @@ New-Item -ItemType Directory -Force -Path output | Out-Null
 & $python collect.py    2>&1 | Out-File -Append -Encoding utf8 $log
 & $python extract.py    2>&1 | Out-File -Append -Encoding utf8 $log
 & $python score_llm.py  2>&1 | Out-File -Append -Encoding utf8 $log
+& $python dedupe.py     2>&1 | Out-File -Append -Encoding utf8 $log
 & $python dashboard.py  2>&1 | Out-File -Append -Encoding utf8 $log
 
 git add docs/index.html 2>&1 | Out-File -Append -Encoding utf8 $log
