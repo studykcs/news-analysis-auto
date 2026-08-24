@@ -23,11 +23,16 @@ CREATE TABLE IF NOT EXISTS items (
     sentiment_score REAL,        -- -5 (very bearish) .. +5 (very bullish), per item
     scope TEXT,                  -- 'macro' | 'market' | 'sector' | 'stock'
     topic TEXT,                  -- free-text tag, e.g. '금리정책', '반도체', '삼성전자'
+    extracted_text TEXT,         -- text pulled from a PDF/document file, if any
+    extract_status TEXT,         -- 'ok' | 'scanned' | 'image_pending' | 'no_file' | 'error'
+    extracted_at TEXT,
+    extract_chars INTEGER,       -- len(extracted_text), for quality monitoring
     PRIMARY KEY (chat_id, message_id)
 );
 """
 
 SCOPES = ("macro", "market", "sector", "stock")
+EXTRACT_STATUSES = ("ok", "scanned", "image_pending", "no_file", "error")
 
 
 def get_connection(db_path: Path | str = DB_PATH) -> sqlite3.Connection:
@@ -40,6 +45,14 @@ def get_connection(db_path: Path | str = DB_PATH) -> sqlite3.Connection:
         conn.execute("ALTER TABLE items ADD COLUMN scope TEXT")
     if "topic" not in existing_cols:
         conn.execute("ALTER TABLE items ADD COLUMN topic TEXT")
+    if "extracted_text" not in existing_cols:
+        conn.execute("ALTER TABLE items ADD COLUMN extracted_text TEXT")
+    if "extract_status" not in existing_cols:
+        conn.execute("ALTER TABLE items ADD COLUMN extract_status TEXT")
+    if "extracted_at" not in existing_cols:
+        conn.execute("ALTER TABLE items ADD COLUMN extracted_at TEXT")
+    if "extract_chars" not in existing_cols:
+        conn.execute("ALTER TABLE items ADD COLUMN extract_chars INTEGER")
     return conn
 
 
@@ -62,6 +75,34 @@ def update_summary(
         (summary, sentiment_score, scope, topic, chat_id, message_id),
     )
     conn.commit()
+
+
+def update_extraction(
+    conn: sqlite3.Connection,
+    chat_id: int,
+    message_id: int,
+    extracted_text: str | None,
+    extract_status: str,
+) -> None:
+    assert extract_status in EXTRACT_STATUSES, f"extract_status must be one of {EXTRACT_STATUSES}, got {extract_status!r}"
+    conn.execute(
+        """
+        UPDATE items SET extracted_text = ?, extract_status = ?, extract_chars = ?,
+                          extracted_at = datetime('now')
+        WHERE chat_id = ? AND message_id = ?
+        """,
+        (extracted_text, extract_status, len(extracted_text) if extracted_text else 0, chat_id, message_id),
+    )
+    conn.commit()
+
+
+def scoring_input(row: sqlite3.Row) -> str:
+    """The text to actually hand an LLM for scoring: caption + any extracted
+    document text. Row needs 'text' and 'extracted_text' keys (sqlite3.Row or
+    a dict). Using row['text'] alone silently drops PDF-only posts that have
+    no caption - always score through this function instead."""
+    parts = [row["text"] or "", row["extracted_text"] or ""]
+    return "\n\n".join(p for p in parts if p).strip()
 
 
 def last_message_id(conn: sqlite3.Connection, chat_id: int) -> int:

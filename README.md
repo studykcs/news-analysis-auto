@@ -6,7 +6,7 @@ Collects PDF/photo/text research posts from Telegram channels into SQLite, and r
 
 1. **Install dependencies**
    ```
-   pip install telethon python-dotenv pandas plotly
+   pip install telethon python-dotenv pandas plotly google-genai pymupdf
    ```
 
 2. **Get a Telegram API key** (personal account, not a bot) from <https://my.telegram.org> → "API development tools". Free, takes a minute.
@@ -38,11 +38,15 @@ Collects PDF/photo/text research posts from Telegram channels into SQLite, and r
 
 ```
 python collect.py         # fetch new items, save files/, upsert SQLite
+python extract.py         # pull text out of downloaded PDFs (first 2 pages)
 python summarize.py       # score unscored items via Gemini API
 python dashboard.py       # render output/dashboard.html
 ```
 
-Or run all three automatically every day - see **Daily automation** below.
+`extract.py` exists because a PDF post with little/no caption is otherwise invisible
+to scoring - see its module docstring for the scanned-PDF / photo-OCR caveats.
+
+Or run all steps automatically every day - see **Daily automation** below.
 
 ## Sentiment scoring
 
