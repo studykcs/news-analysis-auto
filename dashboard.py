@@ -33,7 +33,22 @@ from store import get_connection, latest_scores
 OUT = Path(__file__).parent / "output"
 DOCS_DIR = Path(__file__).parent / "docs"
 
-PLOTLY_VERSION = "6.9.0"
+
+def _bundled_plotlyjs_version() -> str:
+    """The pip package `plotly`'s own version (e.g. 6.9.0) is NOT the
+    plotly.js CDN version - cdn.plot.ly hosts plotly.js releases (e.g.
+    3.7.0), a separately-numbered artifact the Python package happens to
+    bundle. Hardcoding the pip version here 404'd (well, 403'd) on
+    cdn.plot.ly and silently killed every chart. Read the real version out
+    of the bundled JS's own header comment instead, so this can never drift
+    out of sync again after a `pip install -U plotly`."""
+    from plotly.offline import get_plotlyjs
+
+    first_line = get_plotlyjs().splitlines()[1]  # "* plotly.js v3.7.0"
+    return first_line.rsplit("v", 1)[-1].strip()
+
+
+PLOTLY_VERSION = _bundled_plotlyjs_version()
 PLOTLY_CDN = f"https://cdn.plot.ly/plotly-{PLOTLY_VERSION}.min.js"
 
 LEVELS = ("macro", "market", "sector", "stock")
