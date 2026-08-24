@@ -7,3 +7,4 @@ files/
 *.db
 output/
 channels.json
+calibration/gold.csv
