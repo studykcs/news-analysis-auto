@@ -224,13 +224,18 @@ def build_content(conn) -> str:
         ).fetchall()
     )
 
+    # Anonymize channel names for public display - chat_name often contains a real
+    # analyst's name, and this dashboard is published (see docs/index.html).
+    chat_ids = [r[0] for r in conn.execute("SELECT DISTINCT chat_id FROM items ORDER BY chat_id").fetchall()]
+    anon_channel = {chat_id: f"채널{i + 1}" for i, chat_id in enumerate(chat_ids)}
+
     channel_rows = "".join(
-        f"<tr><td>{name}</td><td class='mono'>{n}</td><td class='mono'>{s}</td></tr>"
-        for name, n, s in conn.execute(
+        f"<tr><td>{anon_channel[chat_id]}</td><td class='mono'>{n}</td><td class='mono'>{s}</td></tr>"
+        for chat_id, n, s in conn.execute(
             """
-            SELECT chat_name, COUNT(*),
+            SELECT chat_id, COUNT(*),
                    SUM(CASE WHEN sentiment_score IS NOT NULL THEN 1 ELSE 0 END)
-            FROM items GROUP BY chat_name ORDER BY 2 DESC
+            FROM items GROUP BY chat_id ORDER BY 2 DESC
             """
         ).fetchall()
     )
@@ -344,9 +349,13 @@ def render_dashboard(conn) -> str:
 </html>"""
 
 
+DOCS_DIR = Path(__file__).parent / "docs"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", default=None, help="Output HTML path (default: output/dashboard.html)")
+    parser.add_argument("--no-docs", action="store_true", help="Skip writing docs/index.html (GitHub Pages source)")
     args = parser.parse_args()
 
     conn = get_connection()
@@ -357,6 +366,12 @@ def main() -> None:
     out_path.parent.mkdir(exist_ok=True)
     out_path.write_text(html, encoding="utf-8")
     print(f"Wrote {out_path}")
+
+    if not args.no_docs:
+        DOCS_DIR.mkdir(exist_ok=True)
+        docs_path = DOCS_DIR / "index.html"
+        docs_path.write_text(html, encoding="utf-8")
+        print(f"Wrote {docs_path}")
 
 
 if __name__ == "__main__":
