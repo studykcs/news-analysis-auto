@@ -16,7 +16,9 @@ Collects PDF/photo/text research posts from Telegram channels into SQLite, and r
    TELEGRAM_API_ID=your_api_id
    TELEGRAM_API_HASH=your_api_hash
    TELEGRAM_PHONE=+1xxxxxxxxxx
+   GEMINI_API_KEY=your_gemini_api_key
    ```
+   Get a Gemini key free at <https://aistudio.google.com/apikey>.
 
 4. **Create `channels.json`** (copy `channels.example.json`) with the channels you want to collect from. To find a channel's numeric ID, log in once and list your dialogs:
    ```python
@@ -35,10 +37,39 @@ Collects PDF/photo/text research posts from Telegram channels into SQLite, and r
 ## Usage
 
 ```
-python collect.py        # fetch new items, save files/, upsert SQLite
+python collect.py         # fetch new items, save files/, upsert SQLite
+python summarize.py       # score unscored items via Gemini API
 python dashboard.py       # render output/dashboard.html
 ```
 
+Or run all three automatically every day - see **Daily automation** below.
+
 ## Sentiment scoring
 
-`sentiment_score` (-5..+5) and `scope` (`macro`/`market`/`sector`/`stock`) are **not computed automatically** by this code - they're filled in by manually asking an LLM (e.g. Claude) to read a day's items and call `store.update_summary(...)` for each. See the dashboard's "채점 기준" card for the exact rubric used.
+Every text-bearing item gets three fields filled in by `summarize.py` (Gemini API, one call per unscored day, all channels batched together):
+
+| Field | Meaning |
+|---|---|
+| `sentiment_score` | Integer -5..+5: how bullish/bearish the item is for that day's market |
+| `scope` | `macro` (거시/통화정책/지정학/환율) · `market` (코스피·코스닥 등 시장 전반) · `sector` (업종 단위) · `stock` (개별 종목) |
+| `topic` | Free-text tag, e.g. "금리정책", "삼성전자" |
+
+**`sentiment_score` scale:**
+
+| Score | Meaning |
+|---|---|
+| -5, -4 | 매우 부정 (급락/위기) |
+| -3, -2 | 부정 (하락·우려 지배적) |
+| -1 | 약한 부정/경계 |
+| 0 | 중립/정보성 |
+| +1 | 약한 긍정 |
+| +2, +3 | 긍정 (실적 서프라이즈 등) |
+| +4, +5 | 매우 긍정 (사상 최대 등) |
+
+A day's overall score is the simple average of that day's item scores (see `dashboard.py`). The exact rubric text sent to Gemini lives in `summarize.py` (`RUBRIC`) and is also shown on the dashboard's "채점 기준" card.
+
+Items without text (pure photo/document, no caption) are not scored - `summarize.py` only processes rows where `text IS NOT NULL`.
+
+## Daily automation
+
+`run_pipeline.ps1` runs collect → summarize → dashboard → git commit/push in sequence, so a Windows Task Scheduler job can drive the whole pipeline unattended. See the script for what it assumes (a `python` on PATH, a git remote already configured).
