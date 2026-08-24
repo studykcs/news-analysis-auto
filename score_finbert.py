@@ -114,35 +114,50 @@ def main() -> None:
         print("Nothing to score.")
         return
 
+    # Score in batched passes (pipeline(list, batch_size=...)) rather than one
+    # classifier() call per item - far fewer Python/tokenizer round trips for
+    # the same CPU work, which matters at 1000+ items. Chunked (not one giant
+    # batch) so a failure only costs CHUNK_SIZE items' worth of retry, and so
+    # progress/commits happen incrementally on a long run.
+    CHUNK_SIZE = 200
+    scorable = [(row, scoring_input(row)) for row in rows]
+    scorable = [(row, text) for row, text in scorable if text]
+
     n = 0
     n_error = 0
     by_date: dict[str, int] = defaultdict(int)
-    for row in rows:
-        text = scoring_input(row)
-        if not text:
-            continue
+    for start in range(0, len(scorable), CHUNK_SIZE):
+        chunk = scorable[start : start + CHUNK_SIZE]
+        texts = [text for _, text in chunk]
         try:
-            result = classifier(text, truncation=True, max_length=512)[0]
+            results = classifier(texts, truncation=True, max_length=512, batch_size=16)
         except Exception as e:
+            print(f"  chunk {start}-{start + len(chunk)} failed entirely: {e}")
+            results = [None] * len(chunk)
+
+        for (row, text), result in zip(chunk, results):
+            if result is None:
+                upsert_score(
+                    conn, row["chat_id"], row["message_id"], RUBRIC_VERSION, MODEL_NAME,
+                    raw_response="REQUEST_ERROR: batch scoring failed",
+                )
+                n_error += 1
+                continue
+
+            label = result["label"].lower()
+            score = float(result["score"])
+            direction = LABEL_TO_DIRECTION.get(label)
+            magnitude = confidence_to_magnitude(label, score) if direction is not None else None
+
             upsert_score(
                 conn, row["chat_id"], row["message_id"], RUBRIC_VERSION, MODEL_NAME,
-                raw_response=f"REQUEST_ERROR: {e}",
+                direction=direction, magnitude=magnitude, confidence=score,
+                summary=text[:200], raw_response=str(result),
             )
-            n_error += 1
-            continue
+            n += 1
+            by_date[row["d"]] += 1
 
-        label = result["label"].lower()
-        score = float(result["score"])
-        direction = LABEL_TO_DIRECTION.get(label)
-        magnitude = confidence_to_magnitude(label, score) if direction is not None else None
-
-        upsert_score(
-            conn, row["chat_id"], row["message_id"], RUBRIC_VERSION, MODEL_NAME,
-            direction=direction, magnitude=magnitude, confidence=score,
-            summary=text[:200], raw_response=str(result),
-        )
-        n += 1
-        by_date[row["d"]] += 1
+        print(f"  {min(start + CHUNK_SIZE, len(scorable))}/{len(scorable)} processed")
 
     for date in sorted(by_date):
         print(f"[{date}] scored {by_date[date]} item(s)")
