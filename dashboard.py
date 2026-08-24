@@ -19,6 +19,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import plotly.io as pio
 from plotly.offline import get_plotlyjs
+from plotly.subplots import make_subplots
 
 from store import get_connection
 
@@ -30,6 +31,11 @@ COLORWAY = ["#9C6B2E", "#3F7A5E", "#B3432B", "#4A5A6B", "#7A5C3E"]
 
 SCOPE_LABELS = {"macro": "매크로", "market": "시장 전반", "sector": "섹터", "stock": "개별종목"}
 SCOPE_COLORS = {"macro": "#4A5A6B", "market": "#9C6B2E", "sector": "#7A5C3E", "stock": "#3F7A5E"}
+
+
+def _rgba(hex_color: str, alpha: float) -> str:
+    r, g, b = int(hex_color[1:3], 16), int(hex_color[3:5], 16), int(hex_color[5:7], 16)
+    return f"rgba({r},{g},{b},{alpha})"
 
 STYLE = """
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
@@ -113,38 +119,79 @@ a { color: var(--accent); }
 
 
 def build_sentiment_fig(daily: pd.DataFrame) -> go.Figure:
+    """Line + filled zones so the reader can tell 'good day / bad day' at a glance."""
+    dates = daily["date"]
+    scores = daily["avg_score"]
+    trend = scores.rolling(3, min_periods=1).mean()
+
     fig = go.Figure()
-    colors = [("#B3432B" if v < 0 else "#3F7A5E") for v in daily["avg_score"]]
-    fig.add_bar(x=daily["date"], y=daily["avg_score"], marker_color=colors, name="일별 평균 점수")
+    fig.add_hrect(y0=0, y1=5, fillcolor="#3F7A5E", opacity=0.06, line_width=0)
+    fig.add_hrect(y0=-5, y1=0, fillcolor="#B3432B", opacity=0.06, line_width=0)
+
+    fig.add_bar(
+        x=dates, y=scores, name="그날 평균 점수",
+        marker_color=["#B3432B" if v < 0 else "#3F7A5E" for v in scores],
+        hovertemplate="%{x}<br>평균 %{y:+.2f}<extra></extra>",
+    )
+    fig.add_scatter(
+        x=dates, y=trend, name="3일 이동평균", mode="lines",
+        line=dict(color=CHART_INK, width=2, dash="dot"),
+        hovertemplate="%{x}<br>3일 이동평균 %{y:+.2f}<extra></extra>",
+    )
     fig.add_hline(y=0, line_color=CHART_INK, line_width=1)
+
+    best = daily.loc[scores.idxmax()]
+    worst = daily.loc[scores.idxmin()]
+    for row, dy in ((best, 18), (worst, -18)):
+        fig.add_annotation(
+            x=row["date"], y=row["avg_score"], text=f"{row['avg_score']:+.1f}",
+            showarrow=True, arrowhead=0, ay=dy, ax=0, font=dict(size=11, color=CHART_INK),
+        )
+
     fig.update_layout(
-        title="일별 시장 심리 점수 (평균, -5 ~ +5)",
+        title="일별 시장 심리 점수 — 위(초록)는 그날 우호적, 아래(빨강)는 비우호적 재료가 우세했다는 뜻",
         paper_bgcolor=CHART_PAPER, plot_bgcolor=CHART_PAPER,
         font=dict(family="IBM Plex Sans, sans-serif", color=CHART_INK, size=12),
-        margin=dict(l=10, r=10, t=40, b=10),
-        yaxis=dict(range=[-5, 5], gridcolor="#E3E0D8", zerolinecolor="#E3E0D8"),
-        xaxis=dict(gridcolor="#E3E0D8"),
+        margin=dict(l=10, r=10, t=50, b=10),
+        height=380,
+        yaxis=dict(title="평균 점수 (-5 매우부정 · 0 중립 · +5 매우긍정)", range=[-5, 5], gridcolor="#E3E0D8", zerolinecolor="#E3E0D8"),
+        xaxis=dict(gridcolor="#E3E0D8", tickangle=-45, type="category"),
+        legend=dict(bgcolor="rgba(0,0,0,0)", orientation="h", y=1.15),
+        bargap=0.25,
     )
     return fig
 
 
 def build_scope_fig(scope_daily: pd.DataFrame) -> go.Figure:
-    fig = go.Figure()
-    for scope in ("macro", "market", "sector", "stock"):
+    """Small multiples (one row per scope) instead of grouped bars - grouped bars by
+    date x 4 scopes become unreadable once there are more than a handful of days."""
+    scopes = [s for s in ("macro", "market", "sector", "stock") if not scope_daily[scope_daily["scope"] == s].empty]
+    fig = make_subplots(
+        rows=len(scopes), cols=1, shared_xaxes=True,
+        subplot_titles=[f"{SCOPE_LABELS[s]} ({scope_daily[scope_daily['scope'] == s]['n'].sum():.0f}건)" for s in scopes],
+        vertical_spacing=0.06,
+    )
+    for i, scope in enumerate(scopes, start=1):
         sub = scope_daily[scope_daily["scope"] == scope]
-        if sub.empty:
-            continue
-        fig.add_bar(x=sub["date"], y=sub["avg_score"], name=SCOPE_LABELS[scope], marker_color=SCOPE_COLORS[scope])
-    fig.add_hline(y=0, line_color=CHART_INK, line_width=1)
+        fig.add_scatter(
+            x=sub["date"], y=sub["avg_score"], mode="lines+markers", name=SCOPE_LABELS[scope],
+            line=dict(color=SCOPE_COLORS[scope], width=2), marker=dict(size=5),
+            fill="tozeroy", fillcolor=_rgba(SCOPE_COLORS[scope], 0.13),
+            hovertemplate="%{x}<br>평균 %{y:+.2f}<extra></extra>",
+            showlegend=False, row=i, col=1,
+        )
+        fig.add_hline(y=0, line_color="#B8B2A0", line_width=1, row=i, col=1)
+        fig.update_yaxes(range=[-5, 5], gridcolor="#E3E0D8", row=i, col=1)
+        fig.update_xaxes(gridcolor="#E3E0D8", type="category", row=i, col=1)
+
+    fig.update_xaxes(tickangle=-45, row=len(scopes), col=1)
     fig.update_layout(
-        title="범위별 일별 심리 점수 (매크로 / 시장전반 / 섹터 / 개별종목)",
-        barmode="group",
+        title="범위별 일별 심리 점수 — 매크로/시장/섹터/종목이 같은 날 서로 다르게 움직였는지 비교",
         paper_bgcolor=CHART_PAPER, plot_bgcolor=CHART_PAPER,
         font=dict(family="IBM Plex Sans, sans-serif", color=CHART_INK, size=12),
-        margin=dict(l=10, r=10, t=40, b=10),
-        yaxis=dict(range=[-5, 5], gridcolor="#E3E0D8", zerolinecolor="#E3E0D8"),
-        xaxis=dict(gridcolor="#E3E0D8"),
-        legend=dict(bgcolor="rgba(0,0,0,0)"),
+        margin=dict(l=10, r=10, t=50, b=10),
+        height=180 * len(scopes) + 60,
+        showlegend=False,
     )
     return fig
 
@@ -206,21 +253,6 @@ def build_content(conn) -> str:
         ).fetchall()
     )
 
-    item_rows = "".join(
-        f"<tr><td>{date[:10]}</td><td>{chat}</td>"
-        f"<td><span class='chip neu'>{SCOPE_LABELS.get(scope, scope or '-')}</span></td>"
-        f"<td>{topic or '-'}</td>"
-        f"<td><span class='chip {'pos' if score > 0 else 'neg' if score < 0 else 'neu'}'>{score:+.0f}</span></td>"
-        f"<td>{summary}</td></tr>"
-        for date, chat, scope, topic, score, summary in conn.execute(
-            """
-            SELECT date, chat_name, scope, topic, sentiment_score, summary
-            FROM items WHERE sentiment_score IS NOT NULL
-            ORDER BY date DESC, sentiment_score ASC
-            """
-        ).fetchall()
-    )
-
     latest_score = daily["avg_score"].iloc[-1] if not daily.empty else None
     latest_label = f"{latest_score:+.2f}" if latest_score is not None else "—"
     days_done = len(daily)
@@ -262,10 +294,14 @@ def build_content(conn) -> str:
 
   <div class="card">
     <h2>채점 기준</h2>
-    <p>각 메시지를 Claude가 직접 읽고 그 내용이 <strong>그날 시장 심리에 대해 얼마나 긍정적/부정적인 재료인지</strong>를
-    -5(매우 부정)부터 +5(매우 긍정)까지 정수로 판단합니다. 공식이나 사전 기반 자동 채점이 아니라,
-    지수 등락·실적·정책 발언 등 내용의 맥락을 읽고 매기는 수동 평가입니다. 일별 점수는 그날 처리된
-    항목 점수의 <strong>단순 평균</strong>입니다.</p>
+    <p><strong>Gemini API</strong>(<code>summarize.py</code>)가 하루치 항목을 한 번에 읽고 자동으로 채점합니다.
+    사람이 매번 읽는 게 아니라, 미리 정한 기준(system instruction)을 프롬프트로 주고 구조화된 JSON으로
+    결과를 받는 방식이에요. 각 항목에 대해 그 내용이 <strong>그날 시장 심리에 얼마나 긍정적/부정적인 재료인지</strong>를
+    -5(매우 부정)부터 +5(매우 긍정)까지 정수로 판단합니다. 단순 사전(키워드) 기반이 아니라 지수 등락·실적·정책
+    발언 등 맥락을 함께 고려하도록 지시되어 있습니다. 일별 점수는 그날 채점된 항목 점수의
+    <strong>단순 평균</strong>입니다. 정확한 프롬프트 원문은 저장소의 <code>summarize.py</code> 안 <code>RUBRIC</code>을 참고하세요.</p>
+    <p style="margin-top:0.75rem">내용만으로 판단이 애매한 항목(예: 맥락 없는 링크 하나만 있는 경우)은 억지로
+    점수를 매기지 않고 <strong>결측치(빈 값)</strong>로 남겨둡니다 — 그래프와 통계에는 잡히지 않아요.</p>
     <div class="scale">
       <span class="band">-5·-4 매우 부정 (급락/위기)</span>
       <span class="band">-3·-2 부정 (하락·우려 지배적)</span>
@@ -302,14 +338,9 @@ def build_content(conn) -> str:
     <table><tr><th>채널</th><th>수집</th><th>점수매김</th></tr>{channel_rows}</table>
   </div>
 
-  <div class="card">
-    <h2>처리된 항목 ({scored}건)</h2>
-    <table><tr><th>날짜</th><th>채널</th><th>범위</th><th>주제</th><th>점수</th><th>요약</th></tr>{item_rows}</table>
-  </div>
-
   <footer>
-    남은 항목은 대화창에서 날짜를 요청하시면(예: "8월 20일치 해줘") 이어서 처리됩니다.
-    사진/PDF 캡션이 없는 항목은 아직 이 채점에 포함되지 않았습니다.
+    <code>python summarize.py</code>가 새로 수집된 항목을 자동으로 채점합니다.
+    사진/PDF 캡션이 없는 항목과, 내용만으로 판단이 애매한 항목은 결측치로 남습니다.
   </footer>
 </div>
 """
