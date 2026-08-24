@@ -119,57 +119,38 @@ a { color: var(--accent); }
 
 
 def build_sentiment_fig(daily: pd.DataFrame) -> go.Figure:
-    """Line + filled zones so the reader can tell 'good day / bad day' at a glance."""
-    dates = daily["date"]
-    scores = daily["avg_score"]
-    trend = scores.rolling(3, min_periods=1).mean()
-
+    """One clean line: 리서치 자료들이 그날 시장을 어떻게 봤는지, 하루 단위 평균 톤."""
     fig = go.Figure()
-    fig.add_hrect(y0=0, y1=5, fillcolor="#3F7A5E", opacity=0.06, line_width=0)
-    fig.add_hrect(y0=-5, y1=0, fillcolor="#B3432B", opacity=0.06, line_width=0)
-
-    fig.add_bar(
-        x=dates, y=scores, name="그날 평균 점수",
-        marker_color=["#B3432B" if v < 0 else "#3F7A5E" for v in scores],
-        hovertemplate="%{x}<br>평균 %{y:+.2f}<extra></extra>",
-    )
+    fig.add_hline(y=0, line_color="#B8B2A0", line_width=1)
     fig.add_scatter(
-        x=dates, y=trend, name="3일 이동평균", mode="lines",
-        line=dict(color=CHART_INK, width=2, dash="dot"),
-        hovertemplate="%{x}<br>3일 이동평균 %{y:+.2f}<extra></extra>",
+        x=daily["date"], y=daily["avg_score"], mode="lines+markers",
+        line=dict(color=CHART_INK, width=2),
+        marker=dict(size=7, color=["#B3432B" if v < 0 else "#3F7A5E" for v in daily["avg_score"]]),
+        fill="tozeroy", fillcolor=_rgba(CHART_INK, 0.06),
+        hovertemplate="%{x|%Y-%m-%d}<br>평균 %{y:+.2f}<extra></extra>",
+        showlegend=False,
     )
-    fig.add_hline(y=0, line_color=CHART_INK, line_width=1)
-
-    best = daily.loc[scores.idxmax()]
-    worst = daily.loc[scores.idxmin()]
-    for row, dy in ((best, 18), (worst, -18)):
-        fig.add_annotation(
-            x=row["date"], y=row["avg_score"], text=f"{row['avg_score']:+.1f}",
-            showarrow=True, arrowhead=0, ay=dy, ax=0, font=dict(size=11, color=CHART_INK),
-        )
-
     fig.update_layout(
-        title="일별 시장 심리 점수 — 위(초록)는 그날 우호적, 아래(빨강)는 비우호적 재료가 우세했다는 뜻",
+        title="리서치 자료의 일별 시장 심리 — 위(초록)는 우호적, 아래(빨강)는 비우호적 논조 우세",
         paper_bgcolor=CHART_PAPER, plot_bgcolor=CHART_PAPER,
-        font=dict(family="IBM Plex Sans, sans-serif", color=CHART_INK, size=12),
+        font=dict(family="IBM Plex Sans, sans-serif", color=CHART_INK, size=13),
         margin=dict(l=10, r=10, t=50, b=10),
-        height=380,
-        yaxis=dict(title="평균 점수 (-5 매우부정 · 0 중립 · +5 매우긍정)", range=[-5, 5], gridcolor="#E3E0D8", zerolinecolor="#E3E0D8"),
-        xaxis=dict(gridcolor="#E3E0D8", tickangle=-45, type="category"),
-        legend=dict(bgcolor="rgba(0,0,0,0)", orientation="h", y=1.15),
-        bargap=0.25,
+        height=340,
+        yaxis=dict(title="-5 매우부정 · 0 중립 · +5 매우긍정", range=[-5.2, 5.2], gridcolor="#E3E0D8", zerolinecolor="#B8B2A0"),
+        xaxis=dict(gridcolor="#E3E0D8"),
     )
     return fig
 
 
 def build_scope_fig(scope_daily: pd.DataFrame) -> go.Figure:
-    """Small multiples (one row per scope) instead of grouped bars - grouped bars by
-    date x 4 scopes become unreadable once there are more than a handful of days."""
+    """Small multiples (one row per scope) sharing a real date axis, so the same
+    calendar day always lines up vertically across rows even when a scope has no
+    items on some days (grouped bars on a mismatched category axis were misleading)."""
     scopes = [s for s in ("macro", "market", "sector", "stock") if not scope_daily[scope_daily["scope"] == s].empty]
     fig = make_subplots(
         rows=len(scopes), cols=1, shared_xaxes=True,
         subplot_titles=[f"{SCOPE_LABELS[s]} ({scope_daily[scope_daily['scope'] == s]['n'].sum():.0f}건)" for s in scopes],
-        vertical_spacing=0.06,
+        vertical_spacing=0.08,
     )
     for i, scope in enumerate(scopes, start=1):
         sub = scope_daily[scope_daily["scope"] == scope]
@@ -177,20 +158,19 @@ def build_scope_fig(scope_daily: pd.DataFrame) -> go.Figure:
             x=sub["date"], y=sub["avg_score"], mode="lines+markers", name=SCOPE_LABELS[scope],
             line=dict(color=SCOPE_COLORS[scope], width=2), marker=dict(size=5),
             fill="tozeroy", fillcolor=_rgba(SCOPE_COLORS[scope], 0.13),
-            hovertemplate="%{x}<br>평균 %{y:+.2f}<extra></extra>",
+            hovertemplate="%{x|%Y-%m-%d}<br>평균 %{y:+.2f}<extra></extra>",
             showlegend=False, row=i, col=1,
         )
         fig.add_hline(y=0, line_color="#B8B2A0", line_width=1, row=i, col=1)
-        fig.update_yaxes(range=[-5, 5], gridcolor="#E3E0D8", row=i, col=1)
-        fig.update_xaxes(gridcolor="#E3E0D8", type="category", row=i, col=1)
+        fig.update_yaxes(range=[-5.2, 5.2], gridcolor="#E3E0D8", row=i, col=1)
+        fig.update_xaxes(gridcolor="#E3E0D8", row=i, col=1)
 
-    fig.update_xaxes(tickangle=-45, row=len(scopes), col=1)
     fig.update_layout(
         title="범위별 일별 심리 점수 — 매크로/시장/섹터/종목이 같은 날 서로 다르게 움직였는지 비교",
         paper_bgcolor=CHART_PAPER, plot_bgcolor=CHART_PAPER,
-        font=dict(family="IBM Plex Sans, sans-serif", color=CHART_INK, size=12),
+        font=dict(family="IBM Plex Sans, sans-serif", color=CHART_INK, size=13),
         margin=dict(l=10, r=10, t=50, b=10),
-        height=180 * len(scopes) + 60,
+        height=190 * len(scopes) + 60,
         showlegend=False,
     )
     return fig
@@ -208,6 +188,7 @@ def build_content(conn) -> str:
         """,
         conn,
     )
+    daily["date"] = pd.to_datetime(daily["date"])
 
     scope_daily = pd.read_sql_query(
         """
@@ -217,6 +198,7 @@ def build_content(conn) -> str:
         """,
         conn,
     )
+    scope_daily["date"] = pd.to_datetime(scope_daily["date"])
 
     scope_summary_rows = "".join(
         f"<tr><td>{SCOPE_LABELS.get(scope, scope)}</td><td class='mono'>{n}</td>"

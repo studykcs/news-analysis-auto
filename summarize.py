@@ -32,18 +32,23 @@ DEFAULT_MODEL = "gemini-flash-lite-latest"
 RUBRIC = """당신은 한국 증권사 리서치·뉴스 속보를 읽고 그날 시장 심리에 미치는 영향을 정량화하는
 매크로/주식 애널리스트입니다. 각 항목을 아래 기준으로 판단하세요.
 
-## sentiment_score (-5..+5 정수)
+## sentiment_score (-5.0..+5.0, 소수 첫째 자리까지 연속값)
 그 내용이 시장 심리에 얼마나 긍정적/부정적인 재료인지를 판단합니다. 스코어는 "좋은 뉴스냐 나쁜
 뉴스냐"가 아니라 "이 재료가 시장 참여자의 위험선호를 얼마나 밀어올리거나 끌어내리는가"를 기준으로
 매기세요.
 
-  -5,-4 매우 부정 - 시스템 리스크·급락·패닉 수준 (예: 은행 파산, 전쟁 발발, 사상 최대폭 하락)
-  -3,-2 부정      - 지수/섹터 하락, 우려가 지배적인 논조, 예상치 하회
-  -1              - 약한 부정, 경계감, 단서가 붙은 우려
-  0               - 중립/정보성 (일정 공유, 사실 나열, 방향성 판단 불가)
-  +1              - 약한 긍정
-  +2,+3           - 실적 서프라이즈, 정책 완화, 뚜렷한 반등 등 긍정
-  +4,+5           - 사상 최대 실적/환원, 대형 호재 확정 등 매우 긍정
+**정수로 뭉치지 말고 소수점까지 세밀하게 구분하세요** (예: -2.3, 0.6, 1.8, 4.2). 같은 방향의
+항목이어도 강도가 다르면 반드시 다른 값을 주어야 합니다 — 비슷한 톤이라고 같은 정수로 반올림하지
+마세요.
+
+기준점(anchor):
+  -5.0 시스템 리스크·패닉 (은행 파산, 전쟁 발발)   -3.0 뚜렷한 하락·우려 지배적
+  -1.0 약한 부정/경계                              0.0 중립/정보성 (방향성 판단 불가)
+  +1.0 약한 긍정                                    +3.0 실적 서프라이즈·정책 완화 등 뚜렷한 호재
+  +5.0 사상 최대 실적/환원 등 최상급 호재
+
+이 기준점 사이 값도 근거의 강도에 비례해 촘촘하게 사용하세요 (예: 소폭 하락은 -1.2, 큰 폭 하락은
+-3.7처럼).
 
 **보정 원칙**: 이모지·과장된 문구(🔥, "충격", "대박")에 휘둘리지 말고, 등락률·서프라이즈 폭 같은
 정량 정보와 "사상 최대", "역대급", "우려 지배적" 같은 확정적 어휘를 근거로 강도를 매기세요.
@@ -74,7 +79,7 @@ RUBRIC = """당신은 한국 증권사 리서치·뉴스 속보를 읽고 그날
 class ItemAnalysis(BaseModel):
     item_id: str  # "{chat_id}_{message_id}" - matches the id shown in the prompt
     summary: str
-    sentiment_score: int
+    sentiment_score: float
     scope: Literal["macro", "market", "sector", "stock"]
     topic: str
 
@@ -107,6 +112,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--date", help="Only process this date (YYYY-MM-DD); default: all unscored dates")
     parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument(
+        "--redo", action="store_true",
+        help="Clear existing scores first and re-score (all dates, or just --date if given)",
+    )
     args = parser.parse_args()
 
     load_dotenv()
@@ -116,6 +125,16 @@ def main() -> None:
 
     client = genai.Client(api_key=api_key)
     conn = get_connection()
+
+    if args.redo:
+        reset_sql = "UPDATE items SET sentiment_score=NULL, summary=NULL, scope=NULL, topic=NULL, summarized_at=NULL"
+        reset_params: tuple = ()
+        if args.date:
+            reset_sql += " WHERE substr(date,1,10) = ?"
+            reset_params = (args.date,)
+        n_reset = conn.execute(reset_sql, reset_params).rowcount
+        conn.commit()
+        print(f"--redo: cleared {n_reset} existing score(s)")
 
     query = "SELECT DISTINCT substr(date,1,10) FROM items WHERE sentiment_score IS NULL AND text IS NOT NULL"
     params: tuple = ()
