@@ -1,5 +1,7 @@
 # news-analysis-auto
 
+**Dashboard: https://studykcs.github.io/news-analysis-auto/**
+
 Collects PDF/photo/text research posts from Telegram channels into SQLite, scores
 each item on multiple axes via an LLM, deduplicates stories multiple channels
 cover simultaneously, aggregates the rest into a daily **Research Tone Index**,
