@@ -28,6 +28,7 @@ from plotly.subplots import make_subplots
 
 import market
 from index import daily_index
+from rubric import RUBRIC_VERSION
 from store import get_connection, latest_scores
 
 OUT = Path(__file__).parent / "output"
@@ -398,19 +399,25 @@ def build_event_study_fig(conn, prices_db: str) -> tuple[go.Figure | None, str |
 # ---------------------------------------------------------------------------
 # Gemini (v2) vs KR-FinBERT (finbert-v1) comparison, when both exist
 # ---------------------------------------------------------------------------
-def build_finbert_comparison_fig(conn) -> tuple[go.Figure | None, str | None, dict | None]:
+def build_finbert_comparison_text(conn) -> str:
+    """Plain-text summary, not a chart - the two rubrics disagree on the
+    majority of items (different methodology: structured-extraction LLM vs
+    a 3-class local classifier), so a scatter of discrete-valued scores is
+    mostly overlapping dots at a handful of (x,y) pairs and reads as noise
+    rather than showing anything a sentence doesn't already say."""
     df = pd.read_sql_query(
         """
         SELECT g.direction AS g_dir, g.magnitude AS g_mag, f.direction AS f_dir, f.magnitude AS f_mag
         FROM scores g
         JOIN scores f ON f.chat_id = g.chat_id AND f.message_id = g.message_id
-        WHERE g.rubric_version = 'v2' AND f.rubric_version = 'finbert-v1'
+        WHERE g.rubric_version = ? AND f.rubric_version = 'finbert-v1'
           AND g.direction IS NOT NULL AND f.direction IS NOT NULL
         """,
         conn,
+        params=[RUBRIC_VERSION],
     )
     if df.empty:
-        return None, "두 rubric(v2, finbert-v1)으로 모두 채점된 항목이 아직 없습니다. score_finbert.py를 실행하세요.", None
+        return "두 rubric(v2, finbert-v1)으로 모두 채점된 항목이 아직 없습니다. score_finbert.py를 실행하세요."
 
     df["g_score"] = df["g_dir"] * df["g_mag"]
     df["f_score"] = df["f_dir"] * df["f_mag"]
@@ -418,20 +425,12 @@ def build_finbert_comparison_fig(conn) -> tuple[go.Figure | None, str | None, di
     dir_agree = (df["g_dir"] == df["f_dir"]).mean()
     corr = df["g_score"].corr(df["f_score"]) if n >= 3 else float("nan")
 
-    fig = go.Figure()
-    fig.add_scatter(
-        x=df["g_score"], y=df["f_score"], mode="markers",
-        marker=dict(color="#9C6B2E", size=7, opacity=0.55),
-        hovertemplate="Gemini %{x:+.0f} · FinBERT %{y:+.0f}<extra></extra>",
+    return (
+        f"두 rubric으로 모두 채점된 {n:,}건 기준: 방향(direction) 일치율 <strong>{dir_agree:.0%}</strong>, "
+        f"점수(direction×magnitude) 상관계수 <strong>{corr:+.2f}</strong>. "
+        "Gemini(v2)는 구조화 추출 LLM, FinBERT는 3분류(긍정/중립/부정) 로컬 분류기로 방법론이 달라 "
+        "완전히 일치하지는 않지만, 방향성은 어느 정도 겹칩니다."
     )
-    fig.add_hline(y=0, line_color="#8A8272", line_width=1)
-    fig.add_vline(x=0, line_color="#8A8272", line_width=1)
-    fig.update_layout(
-        **_fig_layout_base(),
-        title=f"Gemini(v2) vs FinBERT 점수 비교 — n={n}, 방향 일치율 {dir_agree:.0%}, 상관 {corr:+.2f}",
-        height=340, xaxis_title="Gemini score (direction×magnitude)", yaxis_title="FinBERT score",
-    )
-    return fig, None, {"n": n, "dir_agree": dir_agree, "corr": corr}
 
 
 # ---------------------------------------------------------------------------
@@ -447,18 +446,25 @@ def build_content(conn, prices_db: str, ewma_span: int) -> str:
 
     # -- scores with item date/chat, direction not null (broad set, for
     #    histogram/heatmap/channel calibration - NOT the index-eligible set)
+    #
+    # Pinned to rubric_version=RUBRIC_VERSION (v2), not "latest scored_at
+    # across any version": once score_finbert.py has scored everything,
+    # its finbert-v1 rows (which never carry level/driver - see
+    # score_finbert.py's docstring) are the most recently scored_at row
+    # for almost every item, so picking "latest" here would silently
+    # blank out the level-based charts (#3, #4) instead of showing Gemini's.
     scores_raw = pd.read_sql_query(
         """
         SELECT s.chat_id, s.level, s.direction, s.magnitude, s.confidence, s.novelty,
                s.rubric_version, i.mention_channels, substr(i.date, 1, 10) AS date
         FROM scores s
-        JOIN (SELECT chat_id, message_id, MAX(scored_at) AS m FROM scores GROUP BY chat_id, message_id) latest
-          ON s.chat_id = latest.chat_id AND s.message_id = latest.message_id AND s.scored_at = latest.m
         JOIN items i ON i.chat_id = s.chat_id AND i.message_id = s.message_id
-        WHERE s.direction IS NOT NULL
+        WHERE s.rubric_version = ?
+          AND s.direction IS NOT NULL
           AND (i.is_cluster_head = 1 OR i.is_cluster_head IS NULL)
         """,
         conn,
+        params=[RUBRIC_VERSION],
     )
     scores_raw["score"] = scores_raw["direction"] * scores_raw["magnitude"]
     scores_raw["channel"] = scores_raw["chat_id"].map(anon)
@@ -482,12 +488,8 @@ def build_content(conn, prices_db: str, ewma_span: int) -> str:
         "SELECT COUNT(*) FROM items WHERE text IS NOT NULL OR extracted_text IS NOT NULL"
     ).fetchone()[0]
     scored_ok = conn.execute(
-        """
-        SELECT COUNT(*) FROM scores s
-        JOIN (SELECT chat_id, message_id, MAX(scored_at) AS m FROM scores GROUP BY chat_id, message_id) latest
-          ON s.chat_id = latest.chat_id AND s.message_id = latest.message_id AND s.scored_at = latest.m
-        WHERE s.direction IS NOT NULL
-        """
+        "SELECT COUNT(*) FROM scores WHERE rubric_version = ? AND direction IS NOT NULL",
+        (RUBRIC_VERSION,),
     ).fetchone()[0]
     coverage_pct = scored_ok / scorable * 100 if scorable else 0
 
@@ -555,11 +557,8 @@ def build_content(conn, prices_db: str, ewma_span: int) -> str:
     else:
         cards.append(f'<div class="chart-card"><h2>6. 이벤트 스터디 (CAR)</h2><p class="note">{ev_note}</p></div>')
 
-    fig8, fb_note, fb_stats = build_finbert_comparison_fig(conn)
-    if fig8 is not None:
-        cards.append(f'<div class="chart-card"><h2>Gemini vs FinBERT 비교</h2><div class="plot-wrap">{_to_html(fig8)}</div></div>')
-    else:
-        cards.append(f'<div class="chart-card"><h2>Gemini vs FinBERT 비교</h2><p class="note">{fb_note}</p></div>')
+    fb_text = build_finbert_comparison_text(conn)
+    cards.append(f'<div class="chart-card"><h2>Gemini vs FinBERT 비교</h2><p class="note">{fb_text}</p></div>')
 
     # ---- item table: last 150, client-side filtered ----
     items_json = json.loads(
@@ -568,13 +567,13 @@ def build_content(conn, prices_db: str, ewma_span: int) -> str:
             SELECT substr(i.date,1,10) AS date, s.chat_id, s.level, s.driver, s.novelty,
                    s.direction, s.magnitude, s.summary
             FROM scores s
-            JOIN (SELECT chat_id, message_id, MAX(scored_at) AS m FROM scores GROUP BY chat_id, message_id) latest
-              ON s.chat_id = latest.chat_id AND s.message_id = latest.message_id AND s.scored_at = latest.m
             JOIN items i ON i.chat_id = s.chat_id AND i.message_id = s.message_id
-            WHERE s.direction IS NOT NULL
+            WHERE s.rubric_version = ?
+              AND s.direction IS NOT NULL
             ORDER BY i.date DESC LIMIT 150
             """,
             conn,
+            params=[RUBRIC_VERSION],
         ).assign(
             channel=lambda d: d["chat_id"].map(anon),
             score=lambda d: d["direction"] * d["magnitude"],
@@ -663,7 +662,7 @@ def build_content(conn, prices_db: str, ewma_span: int) -> str:
     </div>
     <p style="margin-top:0.75rem">비교용으로 <strong>KR-FinBERT</strong>(<code>score_finbert.py</code>, rubric_version=<code>finbert-v1</code>)도 같은 항목을 채점합니다 -
     다만 순수 3분류(긍정/중립/부정) 모델이라 level/driver/ticker 등은 만들 수 없어 direction/magnitude/confidence만 채워집니다.
-    아래 "Gemini vs FinBERT 비교" 차트 참고.</p>
+    아래 "Gemini vs FinBERT 비교" 참고.</p>
     <h2 style="margin-top:1.5rem">한계</h2>
     <ul class="limits">
       <li><strong>발신자 편향</strong>: 종목(stock) 레벨 항목은 위 분포 차트에서 보듯 긍정 편향이 뚜렷합니다 - 리서치 채널이 매수의견/호재 위주로 게시하는 경향의 결과로 보입니다. 그래서 이 지수의 이름도 "시장 심리"가 아니라 <strong>"리서치 채널 논조"</strong>입니다 - 실제로 측정하는 건 시장의 심리가 아니라 이 채널들의 발신 논조입니다.</li>

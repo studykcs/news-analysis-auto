@@ -48,6 +48,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from rubric import RUBRIC_VERSION
 from store import get_connection
 
 LEVELS = ("macro", "market", "sector", "stock")
@@ -59,9 +60,15 @@ MIN_CONFIDENCE = 0.4
 def _scored_items(conn, level: str | None, include_recap: bool) -> pd.DataFrame:
     """Raw (date, chat_id, level, score) rows after the default filters.
 
-    Reads the *latest* score per item (whatever rubric_version last touched
-    it) via the same join pattern as store.latest_scores(), then joins back
-    to items for the date, chat_id, and dedup info.
+    Pinned to rubric_version=RUBRIC_VERSION (v2) - NOT "latest score per
+    item across any rubric_version". That used to be safe when v2 was the
+    only rubric ever run, but score_finbert.py adds a second, independent
+    rubric_version (finbert-v1) that never fills level (see its docstring),
+    so once every item has both, "latest by scored_at" would silently pull
+    in finbert-v1 rows (level=NULL) and mix two different scoring
+    methodologies into the same index instead of keeping them comparable
+    side by side - see build_finbert_comparison_fig in dashboard.py for the
+    intended (and only) place the two are compared.
 
     Filters to is_cluster_head=1 by default (or NULL, for items scored
     before dedupe.py ever ran on them / a DB where it's never been run -
@@ -74,18 +81,13 @@ def _scored_items(conn, level: str | None, include_recap: bool) -> pd.DataFrame:
                s.level, s.direction, s.magnitude, s.confidence, s.novelty,
                i.mention_channels
         FROM scores s
-        JOIN (
-            SELECT chat_id, message_id, MAX(scored_at) AS max_scored_at
-            FROM scores GROUP BY chat_id, message_id
-        ) latest
-          ON s.chat_id = latest.chat_id AND s.message_id = latest.message_id
-         AND s.scored_at = latest.max_scored_at
         JOIN items i ON i.chat_id = s.chat_id AND i.message_id = s.message_id
-        WHERE s.direction IS NOT NULL
+        WHERE s.rubric_version = ?
+          AND s.direction IS NOT NULL
           AND (s.confidence IS NULL OR s.confidence >= ?)
           AND (i.is_cluster_head = 1 OR i.is_cluster_head IS NULL)
     """
-    params: list = [MIN_CONFIDENCE]
+    params: list = [RUBRIC_VERSION, MIN_CONFIDENCE]
     if not include_recap:
         query += " AND (s.novelty IS NULL OR s.novelty != 'recap')"
     if level:
