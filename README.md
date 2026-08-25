@@ -13,6 +13,25 @@ actually measures is the tone of what a handful of brokerage research channels
 choose to publish, not the market's sentiment. Those aren't the same thing -
 see **Limitations** below - so the name says what it is, not what it sounds like.
 
+## Where each piece lives
+
+| Component | File |
+|---|---|
+| Telegram collection (PDF / photo / text) into SQLite | [`collect.py`](collect.py) |
+| **PDF text extraction** (PyMuPDF) | [`extract.py`](extract.py) |
+| **Gemini API** structured multi-axis scoring | [`score_llm.py`](score_llm.py) · [`rubric.py`](rubric.py) |
+| **KR-FinBERT** local scorer (comparison rubric) | [`score_finbert.py`](score_finbert.py) |
+| Near-duplicate clustering (SimHash + rapidfuzz, Union-Find) | [`dedupe.py`](dedupe.py) |
+| Daily index: **shrinkage**, channel-demeaning, breadth | [`index.py`](index.py) |
+| KRX price loading / market proxy | [`market.py`](market.py) |
+| **Lead-lag** correlation + Newey-West (HAC) regression, **CAR event study** | [`validate.py`](validate.py) |
+| Versioned scoring schema (`rubric_version`) | [`store.py`](store.py) |
+| Self-contained HTML dashboard | [`dashboard.py`](dashboard.py) |
+
+Scores are stored **versioned** by `rubric_version`, so the Gemini (`v2`) and
+KR-FinBERT (`finbert-v1`) rubrics coexist and stay comparable instead of
+overwriting each other — see **Alternative scorer: KR-FinBERT** below.
+
 ## Setup
 
 1. **Install dependencies**
@@ -118,6 +137,23 @@ a hand-picked heuristic, not a calibrated one). This does **not** replace
 have scored the same items. `run_pipeline.ps1` does not run it by default -
 run it manually, or add it to the pipeline yourself once you've checked the
 agreement rate is good enough for your use.
+
+**Agreement, measured on all 1,537 items scored under both rubrics:**
+
+| | |
+|---|---|
+| items scored under both | 1,373 (both `direction` non-null) |
+| **direction agreement** | **41%** |
+| **score correlation** (`direction × magnitude`) | **+0.35** |
+
+The two agree far less than the phrase "both are sentiment models" suggests.
+That is the point of keeping both: a structured-extraction LLM reading a full
+research note and a 3-class classifier reading the same text are not
+measuring the same thing, and the index would look materially different
+depending on which one you believed. Neither is validated against a human
+gold standard here — `calibration.py` exists for exactly that, and until it
+is run on a labeled sample, the 41% is a disagreement rate, not evidence that
+either one is right.
 
 ## Deduplication (`dedupe.py`)
 
